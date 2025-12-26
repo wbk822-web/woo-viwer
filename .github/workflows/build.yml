@@ -19,12 +19,12 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        # 필요한 모든 라이브러리를 한 번에 설치합니다.
+        # woolog.py 실행에 필요한 모든 패키지를 설치합니다.
         pip install segyio numpy matplotlib scipy lasio pandas PySide6 pyqtgraph scikit-learn joblib pyinstaller
 
     - name: Build woolog.py
       run: |
-        # 실행 파일 이름을 "우_log_viewer"로 설정했습니다.
+        # --noconsole은 창 기반 프로그램(PySide6)에 적합합니다.
         pyinstaller --onefile --noconsole --name "우_log_viewer" woolog.py
 
     - name: Upload Artifact
@@ -32,5 +32,4 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: woolog_exe
-        # 위에서 만든 파일 이름과 똑같이 맞췄습니다.
         path: dist/우_log_viewer.exe
