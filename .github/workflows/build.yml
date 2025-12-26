@@ -1,14 +1,15 @@
 name: Build EXE
 
 on: 
-  push:             # 코드가 수정될 때 자동 실행
-  workflow_dispatch: # 수동 실행 버튼 활성화
+  push:
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: windows-latest
     steps:
-    - uses: actions/checkout@v3
+    - name: Checkout code
+      uses: actions/checkout@v3
 
     - name: Set up Python
       uses: actions/setup-python@v4
@@ -20,12 +21,13 @@ jobs:
         python -m pip install --upgrade pip
         pip install segyio numpy matplotlib scipy pyinstaller
 
-    - name: Build EXE
+    - name: Build with PyInstaller
       run: |
-        # 파일 이름을 woo_interpreter.py로 정확히 지정했습니다.
+        # 파일명을 woo_interpreter.py로 정확히 매칭했습니다.
         pyinstaller --onefile --noconsole --name "우_interpreter" woo_interpreter.py
 
     - name: Upload EXE
+      if: success()
       uses: actions/upload-artifact@v3
       with:
         name: woo_viewer_exe
