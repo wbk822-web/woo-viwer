@@ -19,13 +19,14 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install segyio numpy matplotlib scipy pyinstaller
+        # lasio 라이브러리를 추가로 설치하도록 수정했습니다.
+        pip install segyio numpy matplotlib scipy lasio pyinstaller
 
     - name: Build woolog.py
       run: |
-        # woolog.py만 빌드합니다. 
-        # 만약 이 프로그램이 검은색 콘솔창이 필요한 도구라면 --noconsole을 삭제하세요.
-        pyinstaller --onefile --noconsole --name "우_log_viewer" woolog.py
+        # 로그 데이터 확인용이므로 콘솔 창이 보이도록 --noconsole을 제외하는 것을 추천합니다.
+        # 만약 GUI 프로그램이라면 다시 --noconsole을 넣으셔도 됩니다.
+        pyinstaller --onefile --name "우_log_viewer" woolog.py
 
     - name: Upload Artifact
       if: success()
