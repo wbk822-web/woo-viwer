@@ -9,10 +9,10 @@ jobs:
     runs-on: windows-latest
     steps:
     - name: Checkout code
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4 # 최신 버전으로 업데이트
 
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5 # 최신 버전으로 업데이트
       with:
         python-version: '3.10'
 
@@ -21,14 +21,13 @@ jobs:
         python -m pip install --upgrade pip
         pip install segyio numpy matplotlib scipy pyinstaller
 
-    - name: Build with PyInstaller
+    - name: Build EXE
       run: |
-        # 파일 이름을 main.py로 통일하여 에러를 방지합니다.
+        # 파일 이름이 main.py 인지 꼭 확인하세요!
         pyinstaller --onefile --noconsole --name "우_interpreter" main.py
 
-    - name: Upload EXE
-      if: success()
-      uses: actions/upload-artifact@v3
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4 # 오류의 원인이었던 부분을 v4로 수정
       with:
         name: woo_viewer_exe
         path: dist/우_interpreter.exe
