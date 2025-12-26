@@ -1,0 +1,30 @@
+name: Build EXE
+
+on: [push] # 코드가 올라오면 자동으로 빌드 시작
+
+jobs:
+  build:
+    runs-on: windows-latest # 윈도우 환경에서 빌드
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10' # 안정적인 3.10 버전 사용
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install segyio numpy matplotlib scipy pyinstaller
+
+    - name: Build with PyInstaller
+      run: |
+        pyinstaller --onefile --noconsole --name "우_interpreter" woo_interpreter.py
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: woo_viewer_exe
+        path: dist/우_viewer.exe
