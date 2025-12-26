@@ -1,0 +1,33 @@
+name: Build EXE
+
+on: 
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4 # 최신 버전으로 업데이트
+
+    - name: Set up Python
+      uses: actions/setup-python@v5 # 최신 버전으로 업데이트
+      with:
+        python-version: '3.10'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install segyio numpy matplotlib scipy pyinstaller
+
+    - name: Build EXE
+      run: |
+        # 파일 이름이 main.py 인지 꼭 확인하세요!
+        pyinstaller --onefile --noconsole --name "우_테크로그" woolog.py
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4 # 오류의 원인이었던 부분을 v4로 수정
+      with:
+        name: woo_viewer_exe
+        path: dist/우_interpreter.exe
