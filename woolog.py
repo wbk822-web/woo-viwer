@@ -1,76 +1,68 @@
 import sys
 import lasio
 import pandas as pd
+import numpy as np
 import pyqtgraph as pg
-from scipy.signal import savgol_filter 
-
-try:
-    from sklearn.ensemble import RandomForestRegressor
-    import joblib
-except ImportError:
-    print("오류: 'scikit-learn' 또는 'joblib' 라이브러리가 없습니다.")
-    print("터미널에서 'pip install scikit-learn joblib'을 실행하세요.")
-    sys.exit()
-
-from PySide6.QtGui import QColor, QBrush, QPen
+from PySide6.QtGui import QColor, QBrush, QPen, QFont
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QListWidget, QFileDialog, QMessageBox, QLineEdit,
     QCheckBox, QLabel, QListWidgetItem, QFrame, QColorDialog,
     QComboBox, QTabWidget, QInputDialog, 
     QTreeWidget, QTreeWidgetItem, QScrollArea,
-    QGroupBox, QSplitter 
+    QGroupBox, QSplitter, QFormLayout
 )
-from PySide6.QtCore import Qt, QSize
+from PySide6.QtCore import Qt
 
 # 커브별 기본 색상 리스트
-CURVE_COLORS = ['b', 'r', 'g', 'c', 'm', 'y', 'k'] # (b)lue, (r)ed, (g)reen, (c)yan, (m)agenta, (y)ellow, (b)lack
+CURVE_COLORS = ['blue', 'red', 'green', 'cyan', 'magenta', 'orange', 'black'] 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         
-        self.setWindowTitle("Woo 테크로그")
-        self.setGeometry(200, 200, 1200, 800)
+        self.setWindowTitle("LAS 분석기 (Final Fix - Ghosting & Tooltip)")
+        self.setGeometry(100, 100, 1400, 900)
         
-        # 1. QSplitter (창 너비 조절) 도입
         self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.setCentralWidget(self.main_splitter)
 
-        # --- 2. 왼쪽: 탭 위젯 ---
+        # --- 왼쪽 패널 ---
         self.tab_widget = QTabWidget()
         
         self.track_tab = QWidget()
-        self.setup_tracks_tab_layout() # (수정) '색상 변경' 버튼 추가됨
+        self.setup_tracks_tab_layout() 
         self.tab_widget.addTab(self.track_tab, "Tracks")
         
         self.top_tab = QWidget()
         self.setup_top_tab_layout() 
         self.tab_widget.addTab(self.top_tab, "Tops")
+
+        self.calc_tab = QWidget()
+        self.setup_calc_tab_layout()
+        self.tab_widget.addTab(self.calc_tab, "Interpretation")
         
-        self.ml_tab = QWidget()
-        self.setup_ml_tab_layout()
-        self.tab_widget.addTab(self.ml_tab, "AI / ML")
+        self.main_splitter.addWidget(self.tab_widget)
         
-        self.main_splitter.addWidget(self.tab_widget) # Splitter에 왼쪽 탭 추가
-        
-        # --- 3. 오른쪽: 플롯 영역 ---
+        # --- 오른쪽 플롯 영역 ---
         self.plot_widget = pg.GraphicsLayoutWidget()
-        self.main_splitter.addWidget(self.plot_widget) # Splitter에 오른쪽 플롯 추가
+        self.plot_widget.setBackground('k') 
+        self.main_splitter.addWidget(self.plot_widget)
         
-        self.main_splitter.setSizes([300, 900]) # 초기 크기 (이전 250에서 300으로 늘림)
+        self.main_splitter.setSizes([450, 950]) 
         
-        # --- 4. 클래스 변수 ---
+        # --- 데이터 ---
         self.las_data = None
         self.data_df = None 
         self.all_curve_names = [] 
-        self.tracks_model = {} # (수정) 데이터 모델 구조 변경됨
+        self.tracks_model = {} 
         self.plot_tracks = {} 
-        self.plot_data_items = {}
         self.well_tops = {} 
-        self.current_ml_model = None 
+        
+        # [중요] Scale 2 ViewBox들을 추적하여 삭제하기 위한 리스트
+        self.secondary_views = [] 
 
-        # --- 5. 마우스 이벤트 프록시 ---
+        # --- 마우스 이벤트 ---
         self.mouse_proxy_move = pg.SignalProxy(
             self.plot_widget.scene().sigMouseMoved, 
             rateLimit=60, 
@@ -82,573 +74,383 @@ class MainWindow(QMainWindow):
         )
 
     # -----------------------------------------------------------------
-    # ##### (수정) 'Tracks' 탭 - '색상 변경' 버튼 추가 #####
+    # UI Setup
     # -----------------------------------------------------------------
     def setup_tracks_tab_layout(self):
-        """'Tracks' 탭의 UI 레이아웃을 '트랙 중심'으로 새로 설계합니다."""
+        scroll = QScrollArea(); scroll.setWidgetResizable(True)
+        content = QWidget(); self.tracks_layout = QVBoxLayout(content)
+
+        self.load_btn = QPushButton("1. LAS 파일 열기"); self.load_btn.clicked.connect(self.load_las_file)
+        self.tracks_layout.addWidget(self.load_btn); self.tracks_layout.addWidget(self.create_separator())
+
+        grp_track = QGroupBox("2. 트랙 관리")
+        ly_track = QVBoxLayout(grp_track)
+        self.track_list = QTreeWidget(); self.track_list.setHeaderHidden(True)
+        self.track_list.currentItemChanged.connect(self.on_track_selection_changed)
+        ly_track.addWidget(self.track_list)
+        ly_btn = QHBoxLayout()
+        btn_add = QPushButton("[+] 트랙 추가"); btn_add.clicked.connect(self.on_add_track)
+        btn_del = QPushButton("[-] 트랙 삭제"); btn_del.clicked.connect(self.on_delete_track)
+        ly_btn.addWidget(btn_add); ly_btn.addWidget(btn_del); ly_track.addLayout(ly_btn)
+        self.tracks_layout.addWidget(grp_track)
+
+        grp_assign = QGroupBox("3. 커브 할당 & 축 이동")
+        ly_assign = QVBoxLayout(grp_assign)
         
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        scroll_content_widget = QWidget()
-        self.tracks_layout = QVBoxLayout(scroll_content_widget)
+        ly_lists = QHBoxLayout()
+        v1 = QVBoxLayout(); v1.addWidget(QLabel("Available:")); self.list_avail = QListWidget(); self.list_avail.setSelectionMode(QListWidget.ExtendedSelection); v1.addWidget(self.list_avail); ly_lists.addLayout(v1)
+        v_btns = QVBoxLayout(); v_btns.addStretch()
+        btn_to_right = QPushButton(">>"); btn_to_right.clicked.connect(self.on_assign_curve)
+        btn_to_left = QPushButton("<<"); btn_to_left.clicked.connect(self.on_unassign_curve)
+        v_btns.addWidget(btn_to_right); v_btns.addWidget(btn_to_left); v_btns.addStretch(); ly_lists.addLayout(v_btns)
+        v2 = QVBoxLayout(); v2.addWidget(QLabel("Assigned [Scale No.]:")); self.list_assigned = QListWidget(); v2.addWidget(self.list_assigned); ly_lists.addLayout(v2)
+        ly_assign.addLayout(ly_lists)
 
-        # --- 0. LAS 파일 로드 ---
-        self.load_button = QPushButton("1. LAS 파일 열기")
-        self.load_button.clicked.connect(self.load_las_file)
-        self.tracks_layout.addWidget(self.load_button)
-        self.tracks_layout.addWidget(self.create_separator())
+        ly_props = QHBoxLayout()
+        btn_col = QPushButton("색상 변경"); btn_col.clicked.connect(self.on_change_curve_color)
+        self.btn_axis = QPushButton("▼ 축 이동 (Scale 1 ↔ 2)")
+        self.btn_axis.setStyleSheet("font-weight: bold; color: #0055ff;")
+        self.btn_axis.clicked.connect(self.on_toggle_curve_axis)
+        ly_props.addWidget(btn_col); ly_props.addWidget(self.btn_axis)
+        ly_assign.addLayout(ly_props)
+        self.tracks_layout.addWidget(grp_assign)
 
-        # --- 1. 트랙 관리 패널 ---
-        track_mgmt_group = QGroupBox("2. 트랙 관리")
-        track_mgmt_layout = QVBoxLayout(track_mgmt_group)
-        self.track_list_widget = QTreeWidget()
-        self.track_list_widget.setHeaderHidden(True)
-        self.track_list_widget.currentItemChanged.connect(self.on_track_selection_changed)
-        track_mgmt_layout.addWidget(self.track_list_widget)
-        track_btn_layout = QHBoxLayout()
-        self.add_track_btn = QPushButton("[+ 새 트랙]")
-        self.add_track_btn.clicked.connect(self.on_add_track)
-        self.del_track_btn = QPushButton("[- 트랙 삭제]")
-        self.del_track_btn.clicked.connect(self.on_delete_track)
-        track_btn_layout.addWidget(self.add_track_btn)
-        track_btn_layout.addWidget(self.del_track_btn)
-        track_mgmt_layout.addLayout(track_btn_layout)
-        self.tracks_layout.addWidget(track_mgmt_group)
-
-        # --- 2. 커브 할당 패널 ---
-        curve_assign_group = QGroupBox("3. 커브 할당")
-        curve_assign_layout = QHBoxLayout(curve_assign_group)
-        available_layout = QVBoxLayout()
-        available_layout.addWidget(QLabel("Available Curves:"))
-        self.available_curves_list = QListWidget()
-        self.available_curves_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
-        available_layout.addWidget(self.available_curves_list)
-        curve_assign_layout.addLayout(available_layout)
-        assign_btn_layout = QVBoxLayout()
-        assign_btn_layout.addStretch()
-        self.assign_curve_btn = QPushButton(">>")
-        self.assign_curve_btn.clicked.connect(self.on_assign_curve)
-        self.unassign_curve_btn = QPushButton("<<")
-        self.unassign_curve_btn.clicked.connect(self.on_unassign_curve)
-        assign_btn_layout.addWidget(self.assign_curve_btn)
-        assign_btn_layout.addWidget(self.unassign_curve_btn)
-        assign_btn_layout.addStretch()
-        curve_assign_layout.addLayout(assign_btn_layout)
-        assigned_layout = QVBoxLayout()
-        assigned_layout.addWidget(QLabel("Assigned Curves (Max 7):"))
-        self.assigned_curves_list = QListWidget()
-        self.assigned_curves_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
-        assigned_layout.addWidget(self.assigned_curves_list)
+        self.grp_settings = QGroupBox("4. 트랙 설정 (Dual Scale)"); ly_set = QVBoxLayout(self.grp_settings)
         
-        # (신규) 개별 커브 색상 변경 버튼
-        self.change_color_btn = QPushButton("선택 커브 색상 변경...")
-        self.change_color_btn.clicked.connect(self.on_change_curve_color)
-        assigned_layout.addWidget(self.change_color_btn)
-        
-        curve_assign_layout.addLayout(assigned_layout)
-        self.tracks_layout.addWidget(curve_assign_group)
+        g1 = QGroupBox("Scale 1 (Top Axis)"); ly_g1 = QVBoxLayout(g1)
+        self.lbl_linked1 = QLabel("연동된 커브: -"); self.lbl_linked1.setStyleSheet("color: blue; font-weight: bold;")
+        ly_g1.addWidget(self.lbl_linked1)
+        l1 = QHBoxLayout()
+        self.min1 = QLineEdit("0"); self.max1 = QLineEdit("100"); self.log1 = QCheckBox("Log")
+        l1.addWidget(QLabel("Min:")); l1.addWidget(self.min1); l1.addWidget(QLabel("Max:")); l1.addWidget(self.max1); l1.addWidget(self.log1)
+        ly_g1.addLayout(l1); ly_set.addWidget(g1)
 
-        # --- 3. 트랙 설정 패널 ---
-        self.track_settings_group = QGroupBox("4. 트랙 설정 (선택된 트랙)")
-        track_settings_layout = QVBoxLayout(self.track_settings_group)
-        track_settings_layout.addWidget(QLabel("값 범위 (Min):"))
-        self.track_min = QLineEdit("0")
-        track_settings_layout.addWidget(self.track_min)
-        track_settings_layout.addWidget(QLabel("값 범위 (Max):"))
-        self.track_max = QLineEdit("100") 
-        track_settings_layout.addWidget(self.track_max)
-        self.track_log = QCheckBox("로그(Log) 스케일") 
-        track_settings_layout.addWidget(self.track_log)
-        track_settings_layout.addWidget(self.create_separator())
-        self.fill_check = QCheckBox("색상 채우기 (Fill)")
-        track_settings_layout.addWidget(self.fill_check)
-        self.fill_type_combo = QComboBox()
-        self.fill_type_combo.addItems(["기준값 (Baseline)", "커브 간 (Curve-Curve)"])
-        self.fill_type_combo.currentTextChanged.connect(self.on_fill_type_changed)
-        track_settings_layout.addWidget(self.fill_type_combo)
-        self.fill_ref_label = QLabel("기준값 (Fill Level):")
-        self.fill_ref_input = QLineEdit("0.0")
-        track_settings_layout.addWidget(self.fill_ref_label)
-        track_settings_layout.addWidget(self.fill_ref_input)
-        self.fill_target_label = QLabel("대상 커브 (트랙 내):")
-        self.fill_target_combo = QComboBox()
-        track_settings_layout.addWidget(self.fill_target_label)
-        track_settings_layout.addWidget(self.fill_target_combo)
-        color_layout = QHBoxLayout()
-        self.fill_color_button = QPushButton("채우기 색상 선택...")
-        self.fill_color_button.clicked.connect(self.open_color_picker)
-        color_layout.addWidget(self.fill_color_button)
-        self.fill_color_preview = QLabel()
-        self.fill_color_preview.setFixedSize(30, 30)
-        self.current_fill_color = QColor('#FFFF00')
-        self.update_color_preview()
-        color_layout.addWidget(self.fill_color_preview)
-        track_settings_layout.addLayout(color_layout)
-        self.apply_button = QPushButton("트랙 설정 적용")
-        self.apply_button.clicked.connect(self.on_apply_track_settings) 
-        track_settings_layout.addWidget(self.apply_button)
-        self.tracks_layout.addWidget(self.track_settings_group)
+        g2 = QGroupBox("Scale 2 (Bottom Axis - Dashed)"); ly_g2 = QVBoxLayout(g2)
+        self.lbl_linked2 = QLabel("연동된 커브: -"); self.lbl_linked2.setStyleSheet("color: red; font-weight: bold;")
+        ly_g2.addWidget(self.lbl_linked2)
+        l2 = QHBoxLayout()
+        self.min2 = QLineEdit("0"); self.max2 = QLineEdit("100"); self.log2 = QCheckBox("Log")
+        l2.addWidget(QLabel("Min:")); l2.addWidget(self.min2); l2.addWidget(QLabel("Max:")); l2.addWidget(self.max2); l2.addWidget(self.log2)
+        ly_g2.addLayout(l2); ly_set.addWidget(g2)
+
+        g_fill = QGroupBox("Fill Settings"); ly_fill = QVBoxLayout(g_fill)
+        h_fill = QHBoxLayout()
+        self.chk_fill = QCheckBox("Enable"); self.cmb_fill_type = QComboBox(); self.cmb_fill_type.addItems(["Baseline", "Curve-Curve"])
+        self.cmb_fill_type.currentTextChanged.connect(self.on_fill_type_changed)
+        h_fill.addWidget(self.chk_fill); h_fill.addWidget(self.cmb_fill_type); ly_fill.addLayout(h_fill)
+        h_fill2 = QHBoxLayout()
+        self.lbl_ref = QLabel("Ref:"); self.txt_ref = QLineEdit("0.0")
+        self.lbl_target = QLabel("To:"); self.cmb_target = QComboBox()
+        self.btn_fill_col = QPushButton("Color"); self.btn_fill_col.clicked.connect(self.open_color_picker)
+        self.lbl_fill_prev = QLabel(); self.lbl_fill_prev.setFixedSize(20,20); self.cur_fill_col = QColor("yellow"); self.update_fill_prev()
+        h_fill2.addWidget(self.lbl_ref); h_fill2.addWidget(self.txt_ref); h_fill2.addWidget(self.lbl_target); h_fill2.addWidget(self.cmb_target); h_fill2.addWidget(self.btn_fill_col); h_fill2.addWidget(self.lbl_fill_prev)
+        ly_fill.addLayout(h_fill2)
+        ly_set.addWidget(g_fill)
+
+        btn_apply = QPushButton("설정 적용 (Apply Plots)"); btn_apply.setStyleSheet("background-color: #dddddd; font-weight: bold; padding: 5px;")
+        btn_apply.clicked.connect(self.on_apply_settings)
+        ly_set.addWidget(btn_apply)
+
+        self.tracks_layout.addWidget(self.grp_settings)
         self.tracks_layout.addStretch()
-        scroll_area.setWidget(scroll_content_widget)
-        main_track_tab_layout = QVBoxLayout(self.track_tab)
-        main_track_tab_layout.addWidget(scroll_area)
-        main_track_tab_layout.setContentsMargins(0,0,0,0)
-        self.track_settings_group.setEnabled(False)
-        self.on_fill_type_changed("기준값 (Baseline)")
+        scroll.setWidget(content); self.tracks_layout.setContentsMargins(0,0,0,0)
+        self.track_tab.setLayout(QVBoxLayout()); self.track_tab.layout().addWidget(scroll)
+        self.grp_settings.setEnabled(False); self.on_fill_type_changed("Baseline")
 
-    # --- (이하 탭들은 14단계와 동일) ---
     def setup_top_tab_layout(self):
-        self.top_layout = QVBoxLayout(self.top_tab)
-        self.top_layout.addWidget(QLabel("Well Top 목록 (차트 클릭: 추가 / 더블클릭: 수정)"))
-        self.top_tree_widget = QTreeWidget()
-        self.top_tree_widget.setColumnCount(2)
-        self.top_tree_widget.setHeaderLabels(["Well Top 이름", "Depth"])
-        self.top_tree_widget.setColumnWidth(0, 150)
-        self.top_tree_widget.itemChanged.connect(self.on_top_item_changed)
-        self.top_layout.addWidget(self.top_tree_widget)
-        self.delete_top_button = QPushButton("선택한 Top 삭제")
-        self.delete_top_button.clicked.connect(self.delete_selected_top)
-        self.top_layout.addWidget(self.delete_top_button)
-        self.top_layout.addStretch()
-    def setup_ml_tab_layout(self):
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        scroll_content_widget = QWidget()
-        self.ml_layout = QVBoxLayout(scroll_content_widget)
-        self.ml_layout.addWidget(QLabel("--- 1. 피처 선택 ---"))
-        self.ml_layout.addWidget(QLabel("Input 커브 (X): (다중 선택 가능)"))
-        self.ml_input_list = QListWidget()
-        self.ml_input_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection) 
-        self.ml_input_list.setMinimumHeight(100) 
-        self.ml_layout.addWidget(self.ml_input_list)
-        self.ml_layout.addWidget(QLabel("Target 커브 (Y): (예측할 커브)"))
-        self.ml_target_combo = QComboBox()
-        self.ml_layout.addWidget(self.ml_target_combo)
-        self.ml_layout.addWidget(self.create_separator())
-        self.ml_layout.addWidget(QLabel("--- 2. 계산 & 스무딩 ---"))
-        self.ml_layout.addWidget(QLabel("수식 계산 (예: (GR-20)/100)"))
-        self.ml_formula_input = QLineEdit()
-        self.ml_layout.addWidget(self.ml_formula_input)
-        self.ml_layout.addWidget(QLabel("새 커브 이름:"))
-        self.ml_formula_name_input = QLineEdit("VSHALE")
-        self.ml_layout.addWidget(self.ml_formula_name_input)
-        self.ml_calculate_button = QPushButton("계산 실행")
-        self.ml_calculate_button.clicked.connect(self.calculate_curve)
-        self.ml_layout.addWidget(self.ml_calculate_button)
-        self.ml_layout.addWidget(self.create_separator())
-        self.ml_layout.addWidget(QLabel("스무딩 (대상 커브는 Target(Y) 사용)"))
-        self.ml_smooth_algo_combo = QComboBox()
-        self.ml_smooth_algo_combo.addItems(["Moving Average", "Median Filter", "Savitzky-Golay"])
-        self.ml_layout.addWidget(self.ml_smooth_algo_combo)
-        self.ml_layout.addWidget(QLabel("Window (홀수, 예: 5, 7..):"))
-        self.ml_smooth_window_input = QLineEdit("5")
-        self.ml_layout.addWidget(self.ml_smooth_window_input)
-        self.ml_smooth_run_button = QPushButton("스무딩 실행")
-        self.ml_smooth_run_button.clicked.connect(self.run_smoothing)
-        self.ml_layout.addWidget(self.ml_smooth_run_button)
-        self.ml_layout.addWidget(self.create_separator())
-        self.ml_layout.addWidget(QLabel("--- 3. 모델 훈련 ---"))
-        self.ml_train_button = QPushButton("모델 훈련 실행")
-        self.ml_train_button.clicked.connect(self.run_model_training)
-        self.ml_layout.addWidget(self.ml_train_button)
-        self.ml_save_button = QPushButton("훈련된 모델 저장...")
-        self.ml_save_button.clicked.connect(self.save_model)
-        self.ml_layout.addWidget(self.ml_save_button)
-        self.ml_layout.addWidget(self.create_separator())
-        self.ml_layout.addWidget(QLabel("--- 4. 예측 실행 ---"))
-        self.ml_load_button = QPushButton("외부 모델 로드...")
-        self.ml_load_button.clicked.connect(self.load_model)
-        self.ml_layout.addWidget(self.ml_load_button)
-        self.ml_status_label = QLabel("모델 상태: 훈련/로드되지 않음")
-        self.ml_status_label.setStyleSheet("color: gray;")
-        self.ml_layout.addWidget(self.ml_status_label)
-        self.ml_layout.addWidget(QLabel("새 커브 이름 (Output):"))
-        self.ml_new_name_input = QLineEdit("DT_pred")
-        self.ml_layout.addWidget(self.ml_new_name_input)
-        self.ml_fill_gaps_check = QCheckBox("Target 커브의 결측치만 채우기")
-        self.ml_fill_gaps_check.setChecked(True)
-        self.ml_layout.addWidget(self.ml_fill_gaps_check)
-        self.ml_predict_button = QPushButton("예측 실행")
-        self.ml_predict_button.clicked.connect(self.run_prediction)
-        self.ml_layout.addWidget(self.ml_predict_button)
-        self.ml_layout.addStretch()
-        scroll_area.setWidget(scroll_content_widget)
-        main_ml_tab_layout = QVBoxLayout(self.ml_tab)
-        main_ml_tab_layout.addWidget(scroll_area)
-        main_ml_tab_layout.setContentsMargins(0,0,0,0)
+        ly = QVBoxLayout(self.top_tab); ly.addWidget(QLabel("Well Top 목록"))
+        self.tree_tops = QTreeWidget(); self.tree_tops.setColumnCount(2); self.tree_tops.setHeaderLabels(["Name", "Depth"])
+        self.tree_tops.itemChanged.connect(self.on_top_changed)
+        ly.addWidget(self.tree_tops)
+        btn_del = QPushButton("선택 삭제"); btn_del.clicked.connect(self.del_top); ly.addWidget(btn_del)
+
+    def setup_calc_tab_layout(self):
+        scroll = QScrollArea(); scroll.setWidgetResizable(True); content = QWidget(); ly = QVBoxLayout(content)
+        grp_archie = QGroupBox("Archie Water Saturation"); ly_archie = QVBoxLayout(grp_archie)
+        f_c = QFormLayout(); self.cmb_rt = QComboBox(); self.cmb_phi = QComboBox()
+        f_c.addRow("Rt:", self.cmb_rt); f_c.addRow("Phi:", self.cmb_phi)
+        self.chk_phi_perc = QCheckBox("Phi is %"); ly_archie.addLayout(f_c); ly_archie.addWidget(self.chk_phi_perc)
+        l_p = QHBoxLayout(); self.txt_a = QLineEdit("1"); self.txt_m = QLineEdit("2"); self.txt_n = QLineEdit("2"); self.txt_rw = QLineEdit("0.1")
+        for l, w in [("a",self.txt_a),("m",self.txt_m),("n",self.txt_n),("Rw",self.txt_rw)]: l_p.addWidget(QLabel(l)); l_p.addWidget(w)
+        ly_archie.addLayout(l_p); btn = QPushButton("Calculate Sw"); btn.clicked.connect(self.run_archie_calc); ly_archie.addWidget(btn)
         
+        grp_gen = QGroupBox("General Formula"); ly_gen = QVBoxLayout(grp_gen)
+        f_g = QFormLayout(); self.txt_new_name = QLineEdit("NewC"); self.txt_formula = QLineEdit()
+        f_g.addRow("Name:", self.txt_new_name); f_g.addRow("Formula:", self.txt_formula)
+        btn_g = QPushButton("Run Formula"); btn_g.clicked.connect(self.run_general_calc)
+        ly_gen.addLayout(f_g); ly_gen.addWidget(btn_g)
+        ly.addWidget(grp_archie); ly.addWidget(grp_gen); ly.addStretch(); scroll.setWidget(content)
+        self.calc_tab.setLayout(QVBoxLayout()); self.calc_tab.layout().addWidget(scroll)
+
     def create_separator(self):
-        line = QFrame()
-        line.setFrameShape(QFrame.Shape.HLine)
-        line.setFrameShadow(QFrame.Shadow.Sunken)
-        return line
+        l = QFrame(); l.setFrameShape(QFrame.HLine); l.setFrameShadow(QFrame.Sunken); return l
 
     # -----------------------------------------------------------------
-    # ##### (수정) 'Tracks' 탭 로직 - 데이터 모델 변경 #####
+    # Logic
     # -----------------------------------------------------------------
-    def on_add_track(self):
-        track_count = len(self.tracks_model) + 1
-        new_track_name = f"Track-{track_count}"
-        while new_track_name in self.tracks_model:
-            track_count += 1; new_track_name = f"Track-{track_count}"
-        
-        # (수정) curves가 딕셔너리{}로 변경됨
-        self.tracks_model[new_track_name] = {
-            "settings": {"min": 0, "max": 100, "log": False},
-            "curves": {}, # 리스트[]가 아닌 딕셔너리
-            "fill": {"enabled": False, "type": "baseline", "level": 0.0, "target": "", "color": "#FFFF00"}
-        }
-        item = QTreeWidgetItem([new_track_name]); item.setData(0, Qt.UserRole, new_track_name)
-        self.track_list_widget.addTopLevelItem(item); self.track_list_widget.setCurrentItem(item); self.update_plots()
-    
-    def on_delete_track(self):
-        current_item = self.track_list_widget.currentItem()
-        if not current_item: QMessageBox.warning(self, "오류", "삭제할 트랙을 선택하세요."); return
-        track_name = current_item.data(0, Qt.UserRole)
-        if track_name in self.tracks_model: del self.tracks_model[track_name]
-        self.track_list_widget.takeTopLevelItem(self.track_list_widget.indexOfTopLevelItem(current_item)); self.update_plots()
-
-    def on_track_selection_changed(self, current_item, previous_item):
-        if not current_item:
-            self.track_settings_group.setEnabled(False); self.available_curves_list.clear(); self.assigned_curves_list.clear(); return
-            
-        self.track_settings_group.setEnabled(True); track_name = current_item.data(0, Qt.UserRole); 
-        if track_name not in self.tracks_model: return # (방어 코드)
-        track_data = self.tracks_model[track_name]
-        
-        settings = track_data["settings"]; self.track_min.setText(str(settings["min"])); self.track_max.setText(str(settings["max"])); self.track_log.setChecked(settings["log"])
-        fill_settings = track_data["fill"]; self.fill_check.setChecked(fill_settings["enabled"])
-        fill_type_str = "기준값 (Baseline)" if fill_settings["type"] == "baseline" else "커브 간 (Curve-Curve)"; self.fill_type_combo.setCurrentText(fill_type_str)
-        self.on_fill_type_changed(fill_type_str); self.fill_ref_input.setText(str(fill_settings["level"])); self.current_fill_color = QColor(fill_settings["color"]); self.update_color_preview()
-
-        # (수정) curves가 딕셔너리이므로 .keys()로 이름 목록을 가져옴
-        assigned_curves_names = list(track_data["curves"].keys())
-        self.assigned_curves_list.clear(); self.assigned_curves_list.addItems(assigned_curves_names)
-        
-        self.fill_target_combo.clear(); self.fill_target_combo.addItems(assigned_curves_names); self.fill_target_combo.setCurrentText(fill_settings["target"])
-        
-        self.available_curves_list.clear(); available = [name for name in self.all_curve_names if name not in assigned_curves_names]; self.available_curves_list.addItems(available)
-
-    def on_apply_track_settings(self):
-        current_item = self.track_list_widget.currentItem()
-        if not current_item: QMessageBox.warning(self, "오류", "설정을 적용할 트랙을 선택하세요."); return
-        track_name = current_item.data(0, Qt.UserRole)
+    def load_las_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Open LAS", "", "LAS Files (*.las)")
+        if not path: return
         try:
-            self.tracks_model[track_name]["settings"] = {"min": float(self.track_min.text()), "max": float(self.track_max.text()), "log": self.track_log.isChecked()}
-            fill_type_str = self.fill_type_combo.currentText()
-            self.tracks_model[track_name]["fill"] = {
-                "enabled": self.fill_check.isChecked(), "type": "baseline" if fill_type_str == "기준값 (Baseline)" else "curve",
-                "level": float(self.fill_ref_input.text()), "target": self.fill_target_combo.currentText(), "color": self.current_fill_color.name()
-            }
-            self.update_plots()
-        except ValueError: QMessageBox.critical(self, "오류", "Min/Max/기준값은 숫자여야 합니다.")
+            las = lasio.read(path)
+            self.las_data = las
+            self.data_df = las.df().reset_index().set_index(las.curves[0].mnemonic)
+            
+            # [수정] 0 이하의 값 NaN 처리 (왼쪽 수직선 제거)
+            self.data_df[self.data_df <= 0] = np.nan
+
+            self.all_curve_names = [c for c in self.data_df.columns if c != las.curves[0].mnemonic]
+            self.tracks_model.clear(); self.well_tops.clear(); self.track_list.clear(); self.grp_settings.setEnabled(False)
+            self.list_assigned.clear(); self.refresh_ui_lists()
+        except Exception as e: QMessageBox.critical(self, "오류", str(e))
+
+    def refresh_ui_lists(self):
+        cur_track = self.track_list.currentItem(); assigned_in_track = []
+        if cur_track:
+             t_name = cur_track.data(0, Qt.UserRole)
+             if t_name in self.tracks_model: assigned_in_track = list(self.tracks_model[t_name]["curves"].keys())
+        self.list_avail.clear(); self.list_avail.addItems([c for c in self.all_curve_names if c not in assigned_in_track])
+        self.cmb_target.clear(); self.cmb_target.addItems(assigned_in_track)
+        self.cmb_rt.clear(); self.cmb_rt.addItems(self.all_curve_names)
+        self.cmb_phi.clear(); self.cmb_phi.addItems(self.all_curve_names)
+        self.refresh_linked_curves_label()
+
+    def refresh_linked_curves_label(self):
+        cur = self.track_list.currentItem()
+        if not cur:
+            self.lbl_linked1.setText("연동된 커브: -"); self.lbl_linked2.setText("연동된 커브: -"); return
+        t_name = cur.data(0, Qt.UserRole)
+        curves = self.tracks_model.get(t_name, {}).get("curves", {})
+        c1 = [k for k, v in curves.items() if v.get("axis", 1) == 1]
+        c2 = [k for k, v in curves.items() if v.get("axis", 1) == 2]
+        self.lbl_linked1.setText(f"연동된 커브 (Top): {', '.join(c1) if c1 else '없음'}")
+        self.lbl_linked2.setText(f"연동된 커브 (Bot): {', '.join(c2) if c2 else '없음'}")
+
+    def on_add_track(self):
+        cnt=len(self.tracks_model)+1; name=f"Track-{cnt}"
+        while name in self.tracks_model: cnt+=1; name=f"Track-{cnt}"
+        self.tracks_model[name] = {"r1": {"min":0, "max":100, "log":False}, "r2": {"min":0, "max":100, "log":False}, "curves": {}, "fill": {"en":False, "type":"Baseline", "lev":0.0, "tgt":"", "col":"#FFFF00"}}
+        item = QTreeWidgetItem([name]); item.setData(0, Qt.UserRole, name)
+        self.track_list.addTopLevelItem(item); self.track_list.setCurrentItem(item); self.update_plots()
+
+    def on_delete_track(self):
+        cur=self.track_list.currentItem()
+        if cur: del self.tracks_model[cur.data(0, Qt.UserRole)]; self.track_list.takeTopLevelItem(self.track_list.indexOfTopLevelItem(cur)); self.update_plots()
+
+    def on_track_selection_changed(self, cur, prev):
+        if not cur: self.grp_settings.setEnabled(False); self.refresh_ui_lists(); self.list_assigned.clear(); return
+        self.grp_settings.setEnabled(True); name=cur.data(0, Qt.UserRole); data=self.tracks_model[name]
+        self.min1.setText(str(data["r1"]["min"])); self.max1.setText(str(data["r1"]["max"])); self.log1.setChecked(data["r1"]["log"])
+        self.min2.setText(str(data["r2"]["min"])); self.max2.setText(str(data["r2"]["max"])); self.log2.setChecked(data["r2"]["log"])
+        fs=data["fill"]; self.chk_fill.setChecked(fs["en"]); self.cmb_fill_type.setCurrentText(fs["type"])
+        self.on_fill_type_changed(fs["type"]); self.txt_ref.setText(str(fs["lev"])); self.cur_fill_col=QColor(fs["col"]); self.update_fill_prev()
+        self.cmb_target.setCurrentText(fs["tgt"])
+        self.list_assigned.clear()
+        for c, p in data["curves"].items():
+            it = QListWidgetItem(f"[Scale {p.get('axis',1)}] {c}")
+            it.setForeground(QBrush(QColor(p["color"])))
+            it.setData(Qt.UserRole, c)
+            self.list_assigned.addItem(it)
+        self.refresh_ui_lists()
 
     def on_assign_curve(self):
-        current_track_item = self.track_list_widget.currentItem(); selected_curves = self.available_curves_list.selectedItems()
-        if not current_track_item: QMessageBox.warning(self, "오류", "커브를 할당할 트랙을 먼저 선택하세요."); return
-        if not selected_curves: QMessageBox.warning(self, "오류", "왼쪽에서 할당할 커브를 선택하세요."); return
-        track_name = current_track_item.data(0, Qt.UserRole); track_data = self.tracks_model[track_name]
-        
-        current_curve_count = len(track_data["curves"])
-        if current_curve_count + len(selected_curves) > 7:
-            QMessageBox.warning(self, "제한", "한 트랙에는 최대 7개의 커브만 할당할 수 있습니다."); return
-            
-        for i, item in enumerate(selected_curves):
-            curve_name = item.text()
-            # (수정) 딕셔너리에 '기본 색상'과 함께 추가
-            if curve_name not in track_data["curves"]:
-                new_color_index = (current_curve_count + i) % len(CURVE_COLORS)
-                track_data["curves"][curve_name] = {"color": CURVE_COLORS[new_color_index]}
-                
-        self.on_track_selection_changed(current_track_item, None); self.update_plots()
+        cur=self.track_list.currentItem(); sels=self.list_avail.selectedItems()
+        if not cur or not sels: return
+        td=self.tracks_model[cur.data(0, Qt.UserRole)]
+        if len(td["curves"])+len(sels)>7: return
+        for i, s in enumerate(sels):
+            cn=s.text(); idx=(len(td["curves"])+i)%len(CURVE_COLORS)
+            td["curves"][cn]={"color":CURVE_COLORS[idx], "axis":1}
+        self.on_track_selection_changed(cur,None); self.update_plots()
 
     def on_unassign_curve(self):
-        current_track_item = self.track_list_widget.currentItem(); selected_curves = self.assigned_curves_list.selectedItems()
-        if not current_track_item or not selected_curves: return
-        track_name = current_track_item.data(0, Qt.UserRole); track_data = self.tracks_model[track_name]
-        
-        for item in selected_curves:
-            curve_name = item.text()
-            # (수정) 딕셔너리에서 Key-Value 쌍 삭제
-            if curve_name in track_data["curves"]:
-                del track_data["curves"][curve_name]
-                
-        self.on_track_selection_changed(current_track_item, None); self.update_plots()
+        cur=self.track_list.currentItem(); sel=self.list_assigned.currentItem()
+        if cur and sel: del self.tracks_model[cur.data(0, Qt.UserRole)]["curves"][sel.data(Qt.UserRole)]; self.on_track_selection_changed(cur,None); self.update_plots()
 
-    # -----------------------------------------------------------------
-    # ##### (신규) 개별 커브 색상 변경 함수 #####
-    # -----------------------------------------------------------------
     def on_change_curve_color(self):
-        """'선택 커브 색상 변경...' 버튼 클릭 시"""
-        current_track_item = self.track_list_widget.currentItem()
-        selected_curve_item = self.assigned_curves_list.currentItem()
-        
-        if not current_track_item:
-            QMessageBox.warning(self, "오류", "트랙을 먼저 선택하세요."); return
-        if not selected_curve_item:
-            QMessageBox.warning(self, "오류", "색상을 변경할 커브를 'Assigned Curves' 리스트에서 선택하세요."); return
+        cur_t=self.track_list.currentItem(); cur_c=self.list_assigned.currentItem()
+        if cur_t and cur_c:
+            t_nm=cur_t.data(0, Qt.UserRole); c_nm=cur_c.data(Qt.UserRole)
+            col=QColorDialog.getColor(QColor(self.tracks_model[t_nm]["curves"][c_nm]["color"]), self)
+            if col.isValid(): self.tracks_model[t_nm]["curves"][c_nm]["color"]=col.name(); self.on_track_selection_changed(cur_t,None); self.update_plots()
 
-        track_name = current_track_item.data(0, Qt.UserRole)
-        curve_name = selected_curve_item.text()
-        
-        if track_name not in self.tracks_model or curve_name not in self.tracks_model[track_name]["curves"]:
-            return # 데이터 모델 불일치 (방어 코드)
-            
-        # 1. 현재 색상 가져오기
-        current_color_hex = self.tracks_model[track_name]["curves"][curve_name]["color"]
-        current_color = QColor(current_color_hex)
-        
-        # 2. 색상 선택 팝업
-        new_color = QColorDialog.getColor(current_color, self, f"{curve_name} 색상 선택")
-        
-        if new_color.isValid():
-            # 3. 데이터 모델에 새 색상 저장
-            self.tracks_model[track_name]["curves"][curve_name]["color"] = new_color.name()
-            # 4. 플롯 즉시 갱신
-            self.update_plots()
+    def on_toggle_curve_axis(self):
+        cur_t=self.track_list.currentItem(); cur_c=self.list_assigned.currentItem()
+        if not cur_t or not cur_c: QMessageBox.warning(self, "알림", "커브를 선택하세요."); return
+        t_nm=cur_t.data(0, Qt.UserRole); c_nm=cur_c.data(Qt.UserRole)
+        p = self.tracks_model[t_nm]["curves"][c_nm]
+        p["axis"] = 2 if p.get("axis", 1) == 1 else 1
+        self.on_track_selection_changed(cur_t,None); self.update_plots()
 
-    def on_fill_type_changed(self, text):
-        if text == "기준값 (Baseline)":
-            self.fill_ref_label.show(); self.fill_ref_input.show(); self.fill_target_label.hide(); self.fill_target_combo.hide()
-        elif text == "커브 간 (Curve-Curve)":
-            self.fill_ref_label.hide(); self.fill_ref_input.hide(); self.fill_target_label.show(); self.fill_target_combo.show()
-    def update_color_preview(self):
-        self.fill_color_preview.setStyleSheet(f"background-color: {self.current_fill_color.name()}; border: 1px solid black;")
+    def on_apply_settings(self):
+        cur=self.track_list.currentItem()
+        if cur:
+            nm=cur.data(0, Qt.UserRole)
+            try:
+                self.tracks_model[nm]["r1"]={"min":float(self.min1.text()), "max":float(self.max1.text()), "log":self.log1.isChecked()}
+                self.tracks_model[nm]["r2"]={"min":float(self.min2.text()), "max":float(self.max2.text()), "log":self.log2.isChecked()}
+                self.tracks_model[nm]["fill"]={"en":self.chk_fill.isChecked(), "type":self.cmb_fill_type.currentText(), "lev":float(self.txt_ref.text()), "tgt":self.cmb_target.currentText(), "col":self.cur_fill_col.name()}
+                self.update_plots()
+            except: pass
+
+    def on_fill_type_changed(self, txt):
+        if txt == "Baseline": self.lbl_ref.show(); self.txt_ref.show(); self.lbl_target.hide(); self.cmb_target.hide()
+        else: self.lbl_ref.hide(); self.txt_ref.hide(); self.lbl_target.show(); self.cmb_target.show()
+    def update_fill_prev(self): self.lbl_fill_prev.setStyleSheet(f"background:{self.cur_fill_col.name()}; border:1px solid #333")
     def open_color_picker(self):
-        color = QColorDialog.getColor(self.current_fill_color, self, "채우기 색상 선택")
-        if color.isValid(): self.current_fill_color = color; self.update_color_preview()
-    def refresh_all_curve_lists(self):
-        current_track_item = self.track_list_widget.currentItem()
-        if current_track_item: self.on_track_selection_changed(current_track_item, None)
-        else: self.available_curves_list.clear(); self.available_curves_list.addItems(self.all_curve_names)
-        self.ml_input_list.clear(); self.ml_target_combo.clear()
-        self.ml_input_list.addItems(self.all_curve_names); self.ml_target_combo.addItems(self.all_curve_names)
-        
-    def load_las_file(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "LAS 파일 선택", "", "LAS Files (*.las)")
-        if not file_path: return
+        c=QColorDialog.getColor(self.cur_fill_col, self)
+        if c.isValid(): self.cur_fill_col=c; self.update_fill_prev()
+    def add_curve_to_data(self, n, d): self.data_df[n]=d; self.all_curve_names.append(n); self.refresh_ui_lists()
+    def run_archie_calc(self):
         try:
-            self.las_data = lasio.read(file_path)
-            # (수정) 일부 LAS 파일은 인덱스 설정이 꼬이는 경우가 있어, reset_index 후 첫 번째 커브(DEPT)로 강제 재설정
-            self.data_df = self.las_data.df().reset_index().set_index(self.las_data.curves[0].mnemonic)
-            
-            self.all_curve_names.clear(); self.tracks_model.clear(); self.well_tops.clear(); self.current_ml_model = None
-            self.track_list_widget.clear(); self.track_settings_group.setEnabled(False); self.assigned_curves_list.clear()
-            self.update_top_list_widget()
-            self.ml_status_label.setText("모델 상태: 훈련/로드되지 않음"); self.ml_status_label.setStyleSheet("color: gray;")
-            self.ml_input_list.clear(); self.ml_target_combo.clear()
-            
-            depth_col = self.las_data.curves[0].mnemonic
-            # (수정) df.columns를 순회하여 실제 존재하는 모든 데이터 커브를 가져옴
-            for curve_name in self.data_df.columns: 
-                if curve_name == depth_col: continue 
-                self.all_curve_names.append(curve_name)
-            
-            self.refresh_all_curve_lists() 
-        except Exception as e:
-            QMessageBox.critical(self, "오류", f"LAS 파일 로드 실패:\n{e}")
+            a=float(self.txt_a.text()); m=float(self.txt_m.text()); n=float(self.txt_n.text()); rw=float(self.txt_rw.text())
+            phi=self.data_df[self.cmb_phi.currentText()].copy(); rt=self.data_df[self.cmb_rt.currentText()]
+            if self.chk_phi_perc.isChecked(): phi=phi/100.0
+            sw=((a*rw)/(phi**m*rt))**(1.0/n); self.add_curve_to_data("Sw", sw.clip(0,1))
+        except: pass
+    def run_general_calc(self):
+        try: self.add_curve_to_data(self.txt_new_name.text(), self.data_df.eval(self.txt_formula.text()))
+        except: pass
+    def on_top_changed(self, i, c): self.update_plots() 
+    def del_top(self): self.update_plots() 
+    def on_plot_clicked(self, evt): 
+        pos=evt[0].scenePos()
+        for p in self.plot_tracks.values():
+            if p.vb.sceneBoundingRect().contains(pos):
+                t, ok=QInputDialog.getText(self, "New Top", "Name:")
+                if ok and t: self.well_tops[t]=p.vb.mapSceneToView(pos).y(); self.update_plots()
 
-    def add_new_curve_to_ui(self, name, data):
-        """새 커브를 마스터 리스트에 추가하고 모든 UI를 갱신합니다."""
-        if name in self.all_curve_names:
-            QMessageBox.warning(self, "경고", f"'{name}' 커브가 이미 존재하여 덮어썼습니다."); 
-        else:
-            self.all_curve_names.append(name)
-        self.refresh_all_curve_lists()
-    
-    def on_plot_clicked(self, event):
-        if self.data_df is None: return
-        click_event = event[0]; clicked_plot = None
-        for plot_item in self.plot_tracks.values():
-            if plot_item.vb.sceneBoundingRect().contains(click_event.scenePos()): clicked_plot = plot_item; break
-        if clicked_plot is not None:
-            mouse_point = clicked_plot.vb.mapSceneToView(click_event.scenePos()); clicked_depth = mouse_point.y()
-            top_name, ok = QInputDialog.getText(self, "Well Top 생성", "새 Top 이름:")
-            if ok and top_name:
-                if top_name in self.well_tops: QMessageBox.warning(self, "오류", "이미 존재하는 Top 이름입니다."); return
-                self.well_tops[top_name] = clicked_depth; print(f"Well Top 추가: {top_name} @ {clicked_depth}"); self.update_top_list_widget(); self.update_plots()
-    def update_top_list_widget(self):
-        self.top_tree_widget.blockSignals(True); self.top_tree_widget.clear(); sorted_tops = sorted(self.well_tops.items(), key=lambda item: item[1]); items_to_add = []
-        for name, depth in sorted_tops: item = QTreeWidgetItem([name, f"{depth:.4f}"]); item.setFlags(item.flags() | Qt.ItemIsEditable); item.setData(0, Qt.UserRole, name); items_to_add.append(item)
-        self.top_tree_widget.addTopLevelItems(items_to_add); self.top_tree_widget.blockSignals(False)
-    def delete_selected_top(self):
-        current_item = self.top_tree_widget.currentItem()
-        if current_item is None: QMessageBox.warning(self, "오류", "삭제할 Top을 리스트에서 선택하세요."); return
-        top_name = current_item.data(0, Qt.UserRole);
-        if top_name in self.well_tops: del self.well_tops[top_name]; print(f"Well Top 삭제: {top_name}"); self.update_top_list_widget(); self.update_plots()
-    def on_top_item_changed(self, item: QTreeWidgetItem, column: int):
-        old_name = item.data(0, Qt.UserRole)
-        if old_name not in self.well_tops: return
-        old_depth = self.well_tops[old_name]
-        if column == 0:
-            new_name = item.text(0)
-            if new_name != old_name and new_name in self.well_tops:
-                QMessageBox.warning(self, "오류", "이미 존재하는 이름입니다."); self.top_tree_widget.blockSignals(True); item.setText(0, old_name); self.top_tree_widget.blockSignals(False); return
-            del self.well_tops[old_name]; self.well_tops[new_name] = old_depth; item.setData(0, Qt.UserRole, new_name)
-        elif column == 1:
-            try: new_depth = float(item.text(1)); self.well_tops[old_name] = new_depth
-            except ValueError:
-                QMessageBox.warning(self, "오류", "깊이는 숫자여야 합니다."); self.top_tree_widget.blockSignals(True); item.setText(1, f"{old_depth:.4f}"); self.top_tree_widget.blockSignals(False); return
-        print(f"Well Top 수정: {self.well_tops}"); self.update_top_list_widget(); self.update_plots()
-    def calculate_curve(self):
-        if self.data_df is None: return
-        new_name = self.ml_formula_name_input.text().strip()
-        formula = self.ml_formula_input.text().strip()
-        if not new_name or not formula: QMessageBox.warning(self, "오류", "수식과 새 커브 이름을 입력하세요."); return
-        try:
-            new_curve_data = self.data_df.eval(formula); self.data_df[new_name] = new_curve_data
-            self.add_new_curve_to_ui(new_name, new_curve_data); QMessageBox.information(self, "성공", f"'{new_name}' 커브가 계산되었습니다.")
-        except Exception as e: QMessageBox.critical(self, "계산 오류", f"수식 계산 중 오류 발생:\n{e}")
-    def run_smoothing(self):
-        if self.data_df is None: return
-        target_curve = self.ml_target_combo.currentText()
-        algo = self.ml_smooth_algo_combo.currentText()
-        new_name = f"{target_curve}_{algo.split(' ')[0].lower()}"
-        try: window = int(self.ml_smooth_window_input.text());
-        except ValueError: QMessageBox.warning(self, "오류", "Window는 숫자여야 합니다."); return
-        if window % 2 == 0: window += 1; self.ml_smooth_window_input.setText(str(window));
-        if not target_curve: QMessageBox.warning(self, "오류", "스무딩할 Target(Y) 커브를 선택하세요."); return
-        source_data = self.data_df[target_curve]; new_data = None
-        try:
-            if algo == "Moving Average": new_data = source_data.rolling(window=window, center=True).mean()
-            elif algo == "Median Filter": new_data = source_data.rolling(window=window, center=True).median()
-            elif algo == "Savitzky-Golay":
-                polyorder = 2 # (임시) 하드코딩
-                if window <= polyorder: QMessageBox.warning(self, "오류", "Window는 Polyorder(2)보다 커야 합니다."); return
-                valid_data = source_data.dropna()
-                if len(valid_data) < window: raise Exception("데이터가 Window 크기보다 적어 Sav-Gol을 적용할 수 없습니다.")
-                smoothed_valid_data = savgol_filter(valid_data, window_length=window, polyorder=polyorder)
-                new_data = pd.Series(smoothed_valid_data, index=valid_data.index); new_data = new_data.reindex(source_data.index)
-            self.data_df[new_name] = new_data; self.add_new_curve_to_ui(new_name, new_data)
-            QMessageBox.information(self, "성공", f"'{new_name}' 커브가 성공적으로 생성되었습니다.")
-        except Exception as e: QMessageBox.critical(self, "스무딩 오류", f"오류 발생:\n{e}")
-    def run_model_training(self):
-        if self.data_df is None: QMessageBox.warning(self, "오류", "먼저 LAS 파일을 로드하세요."); return
-        target_name = self.ml_target_combo.currentText(); input_items = self.ml_input_list.selectedItems(); input_names = [item.text() for item in input_items]
-        if not target_name or not input_names: QMessageBox.warning(self, "오류", "Input 커브(X)와 Target 커브(Y)를 모두 선택하세요."); return
-        if target_name in input_names: QMessageBox.warning(self, "오류", "Input 커브가 Target 커브를 포함할 수 없습니다."); return
-        try:
-            features = input_names + [target_name]; train_df = self.data_df[features].dropna()
-            if train_df.empty: QMessageBox.warning(self, "오류", "선택된 커브 조합에 훈련할 데이터가 없습니다 (모든 행에 NaN 포함)."); return
-            X_train = train_df[input_names]; y_train = train_df[target_name]; QMessageBox.information(self, "훈련 시작", f"{len(train_df)}개의 데이터로 훈련을 시작합니다...")
-            model = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1); model.fit(X_train, y_train); self.current_ml_model = model
-            self.ml_status_label.setText(f"모델 훈련됨 (Target: {target_name})"); self.ml_status_label.setStyleSheet("color: green;"); QMessageBox.information(self, "훈련 완료", "모델 훈련이 완료되었습니다.")
-        except Exception as e: QMessageBox.critical(self, "훈련 오류", f"훈련 중 오류 발생:\n{e}")
-    def save_model(self):
-        if self.current_ml_model is None: QMessageBox.warning(self, "오류", "먼저 모델을 훈련시키거나 로드하세요."); return
-        file_path, _ = QFileDialog.getSaveFileName(self, "모델 저장", "", "Joblib Models (*.joblib)");
-        if not file_path: return
-        try: joblib.dump(self.current_ml_model, file_path); QMessageBox.information(self, "성공", f"모델이 {file_path}에 저장되었습니다.")
-        except Exception as e: QMessageBox.critical(self, "저장 오류", f"모델 저장 중 오류 발생:\n{e}")
-    def load_model(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "모델 로드", "", "Joblib Models (*.joblib)");
-        if not file_path: return
-        try:
-            self.current_ml_model = joblib.load(file_path)
-            try: features = self.current_ml_model.feature_names_in_; status_text = f"모델 로드됨. (Features: {', '.join(features)})"
-            except AttributeError: status_text = "모델 로드됨. (피처 이름 확인 불가)"
-            self.ml_status_label.setText(status_text); self.ml_status_label.setStyleSheet("color: blue;"); QMessageBox.information(self, "성공", "모델을 성공적으로 로드했습니다.")
-        except Exception as e: QMessageBox.critical(self, "로드 오류", f"모델 로드 중 오류 발생:\n{e}")
-    def run_prediction(self):
-        if self.current_ml_model is None: QMessageBox.warning(self, "오류", "먼저 모델을 훈련시키거나 로드하세요."); return
-        if self.data_df is None: QMessageBox.warning(self, "오류", "데이터가 없습니다."); return
-        new_name = self.ml_new_name_input.text().strip(); fill_gaps_only = self.ml_fill_gaps_check.isChecked()
-        if not new_name: QMessageBox.warning(self, "오류", "새 커브 이름을 입력하세요."); return
-        if new_name in self.all_curve_names: QMessageBox.warning(self, "오류", "이미 존재하는 커브 이름입니다."); return
-        try:
-            try: input_names = self.current_ml_model.feature_names_in_
-            except AttributeError: QMessageBox.critical(self, "오류", "로드된 모델에서 피처 이름을 찾을 수 없습니다."); return
-            predict_df = self.data_df[input_names].dropna()
-            if predict_df.empty: QMessageBox.warning(self, "오류", "Input 커브에 예측할 데이터가 없습니다 (모든 행에 NaN 포함)."); return
-            X_predict = predict_df; y_pred = self.current_ml_model.predict(X_predict); pred_series = pd.Series(y_pred, index=predict_df.index, name=new_name)
-            if fill_gaps_only:
-                target_name = self.ml_target_combo.currentText()
-                if not target_name: QMessageBox.warning(self, "오류", "'결측치만 채우기'를 하려면 Target 커브(Y)를 선택해야 합니다."); return
-                final_curve = self.data_df[target_name].copy(); final_curve.fillna(pred_series, inplace=True); self.data_df[new_name] = final_curve
-            else: self.data_df[new_name] = pred_series 
-            self.add_new_curve_to_ui(new_name, self.data_df[new_name])
-            QMessageBox.information(self, "예측 완료", f"'{new_name}' 커브가 생성되었습니다.")
-        except Exception as e: QMessageBox.critical(self, "예측 오류", f"예측 중 오류 발생:\n{e}")
-
-    # --- (수정) 플로팅 및 호버링 - 개별 색상 적용 ---
-    def mouse_moved_across_plots(self, event):
-        pos = event[0] 
+    # -----------------------------------------------------------------
+    # Plotting & Hovering (Fix Ghosting & Tooltip)
+    # -----------------------------------------------------------------
+    def mouse_moved_across_plots(self, evt):
+        pos = evt[0] 
         for track_name, plot_item in self.plot_tracks.items():
             if plot_item.vb.sceneBoundingRect().contains(pos):
                 mouse_point = plot_item.vb.mapSceneToView(pos)
-                data_x = mouse_point.x(); data_y = mouse_point.y()
-                crosshair_items = plot_item.crosshairs 
-                crosshair_items[0].setPos(data_x); crosshair_items[1].setPos(data_y)
-                tooltip_text = f"Track: {track_name}\nDepth: {data_y:.2f}\n"
-                try:
-                    nearest_index = self.data_df.index.get_indexer([data_y], method='nearest')[0]
-                    actual_depth = self.data_df.index[nearest_index]
-                    # (수정) 딕셔너리 순회
-                    for curve_name, curve_props in self.tracks_model[track_name]["curves"].items():
-                        color = curve_props['color'] # 저장된 색상 사용
-                        value = self.data_df.loc[actual_depth, curve_name]
-                        tooltip_text += f"<span style='color: {color}'>{curve_name}</span>: {value:.2f}\n"
-                except Exception as e:
-                    tooltip_text += f"Value(X): {data_x:.2f}"
-                crosshair_items[2].setText(tooltip_text.strip())
-                crosshair_items[2].setPos(data_x, data_y)
-                crosshair_items[0].show(); crosshair_items[1].show(); crosshair_items[2].show()
+                cursor_depth = mouse_point.y()
+                
+                if hasattr(plot_item, 'crosshairs'):
+                    v_line, h_line, label_item = plot_item.crosshairs
+                    v_line.setPos(mouse_point.x()); h_line.setPos(cursor_depth)
+                    
+                    try:
+                        idx_loc = self.data_df.index.get_indexer([cursor_depth], method='nearest')[0]
+                        actual_depth = self.data_df.index[idx_loc]
+                        
+                        tooltip_html = f"<div style='background-color:rgba(0,0,0,0.7); padding:3px;'>"
+                        tooltip_html += f"<span style='color: white; font-weight: bold;'>Depth: {actual_depth:.2f}</span><br>"
+                        
+                        if track_name in self.tracks_model:
+                            curves = self.tracks_model[track_name]["curves"]
+                            for c_name, props in curves.items():
+                                if c_name in self.data_df.columns:
+                                    val = self.data_df[c_name].iloc[idx_loc]
+                                    col = props['color']
+                                    ax = props.get("axis", 1)
+                                    tooltip_html += f"<span style='color: {col};'>[S{ax}] {c_name}: {val:.4f}</span><br>"
+                        tooltip_html += "</div>"
+                        
+                        label_item.setHtml(tooltip_html)
+                        label_item.setPos(mouse_point.x(), cursor_depth) 
+                        v_line.show(); h_line.show(); label_item.show()
+                    except: pass
             else:
-                crosshair_items = plot_item.crosshairs
-                crosshair_items[0].hide(); crosshair_items[1].hide(); crosshair_items[2].hide()
-    
+                if hasattr(plot_item, 'crosshairs'):
+                    v_line, h_line, label_item = plot_item.crosshairs
+                    v_line.hide(); h_line.hide(); label_item.hide()
+
     def update_plots(self):
-        self.plot_widget.clear(); self.plot_tracks.clear(); self.plot_data_items.clear()
-        if self.data_df is None: return
-        depth_index_np = self.data_df.index.values 
-        first_plot = None; plot_col_index = 0
+        # [중요] 기존 플롯 클리어
+        self.plot_widget.clear(); self.plot_tracks.clear()
         
-        for track_name, track_data in self.tracks_model.items():
-            plot_item = self.plot_widget.addPlot(row=0, col=plot_col_index)
-            plot_item.showAxis('bottom', False); plot_item.showAxis('top', True); plot_item.setLabel('top', track_name); plot_item.invertY(True) 
-            settings = track_data["settings"]
-            try: plot_item.setXRange(settings["min"], settings["max"]); plot_item.setLogMode(x=settings["log"], y=False)
-            except Exception as e: print(f"스케일 설정 오류 ({track_name}): {e}")
-            if first_plot is None: first_plot = plot_item; plot_item.setLabel('left', 'Depth') 
-            else: plot_item.setYLink(first_plot) 
-            v_line = pg.InfiniteLine(angle=90, movable=False, pen=(0,0,0,100)); h_line = pg.InfiniteLine(angle=0, movable=False, pen=(0,0,0,100)); tooltip = pg.TextItem(text="", color=(0,0,0), anchor=(-0.1, 1.1), border='w', fill=(255,255,255,150))
-            plot_item.addItem(v_line, ignoreBounds=True); plot_item.addItem(h_line, ignoreBounds=True); plot_item.addItem(tooltip, ignoreBounds=True)
-            v_line.hide(); h_line.hide(); tooltip.hide(); plot_item.crosshairs = (v_line, h_line, tooltip)
-            for top_name, top_depth in self.well_tops.items():
-                top_line = pg.InfiniteLine(pos=top_depth, angle=0, movable=False, pen='r', label=top_name)
-                top_label = pg.InfLineLabel(top_line, text=top_name, position=0.05, anchor=(0, 0), color='r')
-                plot_item.addItem(top_line, ignoreBounds=True); plot_item.addItem(top_label, ignoreBounds=True)
+        # [핵심] 유령 ViewBox 제거: 기존에 생성된 Scale 2 뷰박스들을 scene에서 강제 삭제
+        if hasattr(self, 'secondary_views'):
+            for v in self.secondary_views:
+                if v.scene(): v.scene().removeItem(v)
+            self.secondary_views.clear()
+        else:
+            self.secondary_views = []
+
+        if self.data_df is None: return
+        depths = self.data_df.index.values
+        min_depth = self.data_df.index.min(); max_depth = self.data_df.index.max()
+        first_p = None; c_idx = 0
+        
+        for name, data in self.tracks_model.items():
+            # 1. Main Plot (Scale 1)
+            p1 = self.plot_widget.addPlot(row=0, col=c_idx); p1.showAxis('top', True); p1.showAxis('bottom', False)
+            p1.setLabel('top', name); p1.invertY(True)
+            p1.showGrid(x=True, y=True, alpha=0.3)
+            p1.setYRange(min_depth, max_depth) # Depth Range Fix
             
-            track_curves = {}
-            # (수정) 딕셔너리 순회
-            for curve_name, curve_props in track_data["curves"].items():
-                if curve_name not in self.data_df.columns: continue
-                curve_data_np = self.data_df[curve_name].values
-                color = curve_props['color'] # (수정) 저장된 색상 사용
-                plot_data_item = plot_item.plot(x=curve_data_np, y=depth_index_np, pen=color, name=curve_name); track_curves[curve_name] = plot_data_item
+            r1 = data["r1"]
+            try: p1.setXRange(r1["min"], r1["max"]); p1.setLogMode(r1["log"], False)
+            except: pass
             
-            fill_settings = track_data["fill"]
-            if fill_settings["enabled"]:
+            if not first_p: first_p = p1; p1.setLabel('left', 'Depth')
+            else: p1.setYLink(first_p); p1.showAxis('left', False)
+
+            v_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen('w', width=1, style=Qt.DashLine))
+            h_line = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen('w', width=1, style=Qt.DashLine))
+            label_item = pg.TextItem(anchor=(0, 1)); label_item.setZValue(100) 
+            p1.addItem(v_line); p1.addItem(h_line); p1.addItem(label_item)
+            v_line.hide(); h_line.hide(); label_item.hide()
+            p1.crosshairs = (v_line, h_line, label_item)
+            
+            curves1 = {k:v for k,v in data["curves"].items() if v.get("axis", 1)==1}
+            curves2 = {k:v for k,v in data["curves"].items() if v.get("axis", 1)==2}
+            plot_items = {}
+
+            # Draw Scale 1
+            for c, p in curves1.items():
+                if c in self.data_df:
+                    item = p1.plot(self.data_df[c].values, depths, pen=pg.mkPen(p["color"], width=2))
+                    plot_items[c] = item
+            
+            # Draw Scale 2 (Overlay)
+            if curves2:
+                v2 = pg.ViewBox()
+                # [핵심] 리스트에 추가해서 나중에 지울 수 있게 함
+                self.secondary_views.append(v2)
+                p1.scene().addItem(v2)
+                p1.getAxis('bottom').linkToView(v2)
+                v2.setYLink(p1) # Y축만 링크
+                
+                p1.showAxis('bottom', True); p1.getAxis('bottom').setLabel(f"{name} (Scale 2)")
+                r2 = data["r2"]
+                try: v2.setXRange(r2["min"], r2["max"]) 
+                except: pass
+                
+                def update_v2_geometry():
+                    v2.setGeometry(p1.vb.sceneBoundingRect())
+                    v2.setYRange(p1.vb.viewRange()[1][0], p1.vb.viewRange()[1][1], padding=0)
+                p1.vb.sigResized.connect(update_v2_geometry)
+                update_v2_geometry() 
+                
+                for c, p in curves2.items():
+                    if c in self.data_df:
+                        pen = pg.mkPen(p["color"], width=2, style=Qt.DashLine)
+                        item = pg.PlotCurveItem(self.data_df[c].values, depths, pen=pen)
+                        v2.addItem(item)
+
+            for t, d in self.well_tops.items(): p1.addItem(pg.InfiniteLine(pos=d, angle=0, pen='r'))
+
+            fs = data["fill"]
+            if fs["en"] and curves1:
                 try:
-                    fill_brush = pg.mkBrush(fill_settings["color"])
-                    if fill_settings["type"] == "baseline":
-                        if track_data["curves"]:
-                            first_curve_name = list(track_data["curves"].keys())[0] # (수정) 딕셔너리의 첫 번째 Key
-                            first_curve_item = track_curves[first_curve_name]
-                            first_curve_item.setFillBrush(fill_brush); first_curve_item.setFillLevel(fill_settings["level"])
-                    elif fill_settings["type"] == "curve":
-                        target_curve_name = fill_settings["target"]
-                        if len(track_data["curves"]) >= 2 and target_curve_name in track_curves:
-                            first_curve_name = list(track_data["curves"].keys())[0] # (수정) 딕셔너리의 첫 번째 Key
-                            curve1_item = track_curves[first_curve_name]; curve2_item = track_curves[target_curve_name]
-                            if first_curve_name == target_curve_name: QMessageBox.warning(self, "Fill 오류", f"'{track_name}'에서 커브 1과 대상 커브가 같습니다.")
-                            else: fill_item = pg.FillBetweenItem(curve1_item, curve2_item, brush=fill_brush); plot_item.addItem(fill_item)
-                except Exception as e: print(f"Fill 생성 오류 ({track_name}): {e}")
-            self.plot_tracks[track_name] = plot_item
-            plot_col_index += 1
+                    c1 = list(curves1.keys())[0]; i1 = plot_items.get(c1)
+                    if i1:
+                        b = pg.mkBrush(fs["col"])
+                        if fs["type"]=="Baseline": i1.setFillLevel(fs["lev"]); i1.setFillBrush(b)
+                        elif fs["type"]=="Curve-Curve":
+                            tgt=fs["tgt"]; i2=plot_items.get(tgt)
+                            if i2 and c1!=tgt: p1.addItem(pg.FillBetweenItem(i1, i2, brush=b))
+                except: pass
+
+            self.plot_tracks[name] = p1; c_idx += 1
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    window = MainWindow()
-    window.show()
+    win = MainWindow(); win.show()
     sys.exit(app.exec())
