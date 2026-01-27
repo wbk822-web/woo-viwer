@@ -1,43 +1,40 @@
 name: Build EXE with PyInstaller
 
-# 언제 실행할지 설정 (수동 실행 + main 브랜치 푸시 시)
 on:
-  workflow_dispatch:
+  workflow_dispatch:      # 수동 실행 버튼 활성화
   push:
-    branches: [ "main" ]
+    branches: [ "main" ]  # main 브랜치에 푸시될 때 실행
 
 jobs:
   build:
-    runs-on: windows-latest  # 윈도우 환경에서 빌드
+    runs-on: windows-latest
 
     steps:
-    # 1. 코드 체크아웃
+    # 1. 내 코드 가져오기
     - name: Checkout code
       uses: actions/checkout@v4
 
-    # 2. 파이썬 3.10 설정 (호환성이 가장 무난함)
+    # 2. 파이썬 설치 (에러 원인이었던 cache 옵션을 제거했습니다)
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: '3.10'
-        cache: 'pip' # pip 캐싱으로 속도 향상
+        python-version: '3.10' 
+        # cache: 'pip'  <-- 이 줄을 삭제하여 에러 해결
 
-    # 3. 라이브러리 설치
-    # requirements.txt가 있다면 'pip install -r requirements.txt'로 대체 가능
+    # 3. 라이브러리 설치 (requirements.txt 없이 직접 설치)
+    # 사용 중인 모듈: PySide6, matplotlib, numpy, scipy, segyio, contextily, pyproj
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
         pip install PySide6 matplotlib numpy scipy segyio contextily pyproj pyinstaller
 
-    # 4. PyInstaller로 빌드 (핵심 단계)
-    # --onefile: 파일 하나로 뭉침
-    # --windowed: 실행 시 검은색 콘솔창 안 뜨게 함 (GUI 프로그램용)
-    # --hidden-import: PyInstaller가 가끔 놓치는 모듈 강제 포함
+    # 4. exe 빌드 (PyInstaller)
+    # main.py를 기준으로 빌드하며, 지도 관련 라이브러리(contextily, pyproj) 데이터를 강제로 포함시킵니다.
     - name: Build EXE
       run: |
-        pyinstaller main.py --name "SeismicViewer" --onefile --windowed --clean --hidden-import="PySide6.QtSvg" --collect-all="contextily" --collect-all="pyproj"
+        pyinstaller main.py --name "SeismicViewer" --onefile --windowed --clean --collect-all="contextily" --collect-all="pyproj"
 
-    # 5. 결과물 업로드 (GitHub Actions 페이지에서 다운로드 가능하게 함)
+    # 5. 결과물 업로드 (빌드 끝나면 다운로드 가능)
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
