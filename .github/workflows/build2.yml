@@ -17,20 +17,21 @@ jobs:
       uses: actions/setup-python@v5
       with:
         python-version: '3.10'
-        # cache 옵션 제거됨
+        # cache 옵션은 에러 방지를 위해 끕니다.
 
     # 1. 라이브러리 설치
-    # rasterio를 명시적으로 추가하여 설치를 확실하게 합니다.
+    # rasterio를 포함한 모든 의존성을 설치합니다.
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
         pip install PySide6 matplotlib numpy scipy segyio contextily pyproj rasterio pyinstaller
 
-    # 2. EXE 빌드 (수정된 부분)
-    # --collect-all "rasterio"를 추가하여 에러를 해결합니다.
+    # 2. EXE 빌드 (여기가 수정되었습니다!)
+    # --collect-all "rasterio": rasterio 안의 모든 숨겨진 파일을 강제로 긁어모으는 옵션입니다.
+    # --collect-all "contextily": 지도 라이브러리 데이터도 강제로 모읍니다.
     - name: Build EXE
       run: |
-        pyinstaller main.py --name "SeismicViewer" --onefile --windowed --clean --collect-all "contextily" --collect-all "pyproj" --collect-all "rasterio"
+        pyinstaller main.py --name "SeismicViewer" --onefile --windowed --clean --collect-all "contextily" --collect-all "rasterio" --collect-all "pyproj"
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
