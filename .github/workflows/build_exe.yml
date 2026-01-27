@@ -17,17 +17,18 @@ jobs:
       uses: actions/setup-python@v5
       with:
         python-version: '3.10'
-        # cache 옵션 삭제됨 (에러 방지)
 
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install numpy segyio matplotlib scipy pyinstaller
+        pip install numpy segyio matplotlib scipy requests pyinstaller
 
     - name: Build with PyInstaller
-      # [수정] 줄바꿈 기호(^)를 제거하고 한 줄로 작성 (PowerShell 호환성 문제 해결)
       run: |
-        pyinstaller --noconsole --onefile --clean --hidden-import=scipy.spatial.transform._rotation_groups --hidden-import=mpl_toolkits.axes_grid1 --name "SegyViewer" main.py
+        pyinstaller --noconsole --onefile --clean \
+        --hidden-import=scipy.spatial.transform._rotation_groups \
+        --hidden-import=mpl_toolkits.axes_grid1 \
+        --name "SegyViewer" main.py
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
