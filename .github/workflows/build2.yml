@@ -1,33 +1,45 @@
-name: Build EXE
+name: Build EXE with PyInstaller
 
-on: 
-  push:
+# 언제 실행할지 설정 (수동 실행 + main 브랜치 푸시 시)
+on:
   workflow_dispatch:
+  push:
+    branches: [ "main" ]
 
 jobs:
   build:
-    runs-on: windows-latest
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4 # 최신 버전으로 업데이트
+    runs-on: windows-latest  # 윈도우 환경에서 빌드
 
+    steps:
+    # 1. 코드 체크아웃
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    # 2. 파이썬 3.10 설정 (호환성이 가장 무난함)
     - name: Set up Python
-      uses: actions/setup-python@v5 # 최신 버전으로 업데이트
+      uses: actions/setup-python@v5
       with:
         python-version: '3.10'
+        cache: 'pip' # pip 캐싱으로 속도 향상
 
+    # 3. 라이브러리 설치
+    # requirements.txt가 있다면 'pip install -r requirements.txt'로 대체 가능
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install segyio numpy matplotlib scipy pyinstaller
+        pip install PySide6 matplotlib numpy scipy segyio contextily pyproj pyinstaller
 
+    # 4. PyInstaller로 빌드 (핵심 단계)
+    # --onefile: 파일 하나로 뭉침
+    # --windowed: 실행 시 검은색 콘솔창 안 뜨게 함 (GUI 프로그램용)
+    # --hidden-import: PyInstaller가 가끔 놓치는 모듈 강제 포함
     - name: Build EXE
       run: |
-        # 파일 이름이 main.py 인지 꼭 확인하세요!
-        pyinstaller --onefile --noconsole --name "우_테크로그" woolog.py
+        pyinstaller main.py --name "SeismicViewer" --onefile --windowed --clean --hidden-import="PySide6.QtSvg" --collect-all="contextily" --collect-all="pyproj"
 
+    # 5. 결과물 업로드 (GitHub Actions 페이지에서 다운로드 가능하게 함)
     - name: Upload Artifact
-      uses: actions/upload-artifact@v4 # 오류의 원인이었던 부분을 v4로 수정
+      uses: actions/upload-artifact@v4
       with:
-        name: woo_viewer_exe
-        path: dist/우_interpreter.exe
+        name: SeismicViewer_Windows_EXE
+        path: dist/SeismicViewer.exe
