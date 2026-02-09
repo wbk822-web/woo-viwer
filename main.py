@@ -1,644 +1,665 @@
-# =============================================================================
-# 0. [필수] 보안/네트워크 패치 (KNOC 사내망용)
-# =============================================================================
-import os
-import ssl
-import requests
-from requests.packages.urllib3.exceptions import InsecureRequestWarning
-
-# 1. 경고 메시지 끄기
-requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
-
-# 2. SSL 인증서 검증 무력화 (표준 라이브러리)
-ssl._create_default_https_context = ssl._create_unverified_context
-
-# 3. Requests 라이브러리 강제 패치 (Contextily 지도 다운로드용)
-# 환경변수 설정만으로는 부족할 때가 있어 함수 자체를 오버라이딩합니다.
-old_merge_environment_settings = requests.Session.merge_environment_settings
-
-def merge_environment_settings(self, url, proxies, stream, verify, cert):
-    # verify를 무조건 False로 고정
-    return old_merge_environment_settings(self, url, proxies, stream, False, cert)
-
-requests.Session.merge_environment_settings = merge_environment_settings
-
-# =============================================================================
-# 1. 라이브러리 임포트
-# =============================================================================
-import sys
-import json
-import csv
+import sys, os, json
 import numpy as np
 import segyio
-from scipy.interpolate import griddata
-import contextily as ctx
-from pyproj import Transformer
 
-# PySide6 (Qt) Imports
-from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                               QHBoxLayout, QPushButton, QLabel, QComboBox, 
-                               QFileDialog, QMessageBox, QCheckBox, 
-                               QSlider, QGroupBox)
+# --- Speed Optimization ---
+try:
+    from scipy.spatial import cKDTree
+    HAS_SCIPY = True
+except ImportError:
+    HAS_SCIPY = False
+
+# --- GIS Support ---
+try:
+    import geopandas as gpd
+    HAS_GEOPANDAS = True
+except ImportError:
+    HAS_GEOPANDAS = False
+# --------------------------
+
+from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
+                               QPushButton, QLabel, QFileDialog, QSlider, QCheckBox, QComboBox, 
+                               QMessageBox, QDoubleSpinBox, QTabWidget, QSpinBox, QListWidget, 
+                               QListWidgetItem, QAbstractItemView, QDialog, QFormLayout, 
+                               QDialogButtonBox, QGroupBox, QPlainTextEdit, QTableWidget, 
+                               QTableWidgetItem, QHeaderView, QRadioButton, QButtonGroup, QStatusBar, QSplitter)
 from PySide6.QtCore import Qt, Signal
-
-# Matplotlib for Qt
-import matplotlib
-matplotlib.use('QtAgg')
-import matplotlib.pyplot as plt
+from PySide6.QtGui import QFont
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
-from mpl_toolkits.axes_grid1 import make_axes_locatable
+from matplotlib.ticker import FuncFormatter, StrMethodFormatter
 
 # =============================================================================
-# 2. SEGY 뷰어 (상세 단면 보기)
+# 1. Header Viewer
+# =============================================================================
+class SegyHeaderViewer(QDialog):
+    def __init__(self, filename, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Header Inspector - {os.path.basename(filename)}")
+        self.resize(900, 600)
+        l = QVBoxLayout(self); self.tabs = QTabWidget(); l.addWidget(self.tabs)
+        self.txt = QPlainTextEdit(); self.txt.setReadOnly(True); self.txt.setFont(QFont("Consolas", 10))
+        self.tabs.addTab(self.txt, "Text Header")
+        self.tbl = QTableWidget(); self.tbl.setColumnCount(3); self.tbl.setHorizontalHeaderLabels(["Byte","Desc","Value"])
+        self.tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.tabs.addTab(self.tbl, "Binary Header")
+        self.load(filename)
+        l.addWidget(QPushButton("Close", clicked=self.accept))
+
+    def load(self, fn):
+        try:
+            with segyio.open(fn, ignore_geometry=True) as f:
+                try: t = segyio.tools.wrap(f.text[0]) if hasattr(segyio.tools,'wrap') else f.text[0].decode('ascii','ignore')
+                except: t = "Decode Error"
+                self.txt.setPlainText(str(t))
+                bh = f.bin; self.tbl.setRowCount(len(bh))
+                smap = {3201:"Job ID", 3205:"Line", 3213:"Trc/Ens", 3217:"Interval", 3221:"Samples", 3225:"Format", 3255:"Meas Sys"}
+                for k,v in sorted(bh.items(), key=lambda x: int(x[0])):
+                    r = self.tbl.rowCount(); self.tbl.insertRow(r)
+                    self.tbl.setItem(r,0,QTableWidgetItem(str(k)))
+                    self.tbl.setItem(r,1,QTableWidgetItem(smap.get(k,f"Byte {k}")))
+                    self.tbl.setItem(r,2,QTableWidgetItem(str(v)))
+        except Exception as e: self.txt.setPlainText(f"Err: {e}")
+
+# =============================================================================
+# 2. Import Wizard
+# =============================================================================
+class SegyHeaderDialog(QDialog):
+    def __init__(self, filename, parent=None):
+        super().__init__(parent)
+        self.filename = filename
+        self.setWindowTitle(f"Import Settings - {os.path.basename(filename)}")
+        self.resize(500, 700)
+        l = QVBoxLayout(self)
+        h = QHBoxLayout(); h.addWidget(QLabel(f"<b>{os.path.basename(filename)}</b>"))
+        h.addWidget(QPushButton("Check Headers", clicked=lambda: SegyHeaderViewer(filename, self).exec()))
+        l.addLayout(h)
+        
+        g1 = QGroupBox("1. CRS"); f1 = QFormLayout(g1)
+        self.cb_crs = QComboBox(); self.cb_crs.setEditable(True)
+        self.cb_crs.addItems(["WGS 84 / UTM zone 52S", "WGS 84 / UTM zone 53S", "WGS 84 / UTM zone 52N", "Unknown"])
+        f1.addRow("System:", self.cb_crs); l.addWidget(g1)
+        
+        g2 = QGroupBox("2. Bytes"); f2 = QFormLayout(g2)
+        self.sb_cdp = QSpinBox(); self.sb_cdp.setRange(1,240); self.sb_cdp.setValue(21)
+        self.sb_x = QSpinBox(); self.sb_x.setRange(1,240); self.sb_x.setValue(181)
+        self.sb_y = QSpinBox(); self.sb_y.setRange(1,240); self.sb_y.setValue(185)
+        f2.addRow("CDP:", self.sb_cdp); f2.addRow("X:", self.sb_x); f2.addRow("Y:", self.sb_y)
+        l.addWidget(g2)
+        
+        g3 = QGroupBox("3. Scalar"); v3 = QVBoxLayout(g3)
+        self.rb_h = QRadioButton("Header (Byte 71)"); self.rb_h.setChecked(True)
+        self.sb_sc = QSpinBox(); self.sb_sc.setRange(1,240); self.sb_sc.setValue(71)
+        self.rb_m = QRadioButton("Manual"); self.rb_n = QRadioButton("None")
+        self.db_mx = QDoubleSpinBox(); self.db_mx.setRange(1e-6, 1e6); self.db_mx.setValue(1.0); self.db_mx.setDecimals(6)
+        self.db_my = QDoubleSpinBox(); self.db_my.setRange(1e-6, 1e6); self.db_my.setValue(1.0); self.db_my.setDecimals(6)
+        bg = QButtonGroup(self); bg.addButton(self.rb_h); bg.addButton(self.rb_m); bg.addButton(self.rb_n)
+        h1 = QHBoxLayout(); h1.addWidget(self.rb_h); h1.addWidget(QLabel("Byte:")); h1.addWidget(self.sb_sc)
+        h2 = QHBoxLayout(); h2.addWidget(self.rb_m); h2.addWidget(QLabel("X*:")); h2.addWidget(self.db_mx); h2.addWidget(QLabel("Y*:")); h2.addWidget(self.db_my)
+        v3.addLayout(h1); v3.addLayout(h2); v3.addWidget(self.rb_n); l.addWidget(g3)
+        
+        g4 = QGroupBox("4. Data"); f4 = QFormLayout(g4)
+        self.sb_sr = QDoubleSpinBox(); self.sb_sr.setRange(0.01, 1000); self.sb_sr.setValue(4.0)
+        f4.addRow("SR (ms):", self.sb_sr); l.addWidget(g4)
+        
+        self.chk = QCheckBox("Apply to all"); l.addWidget(self.chk)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept); bb.rejected.connect(self.reject); l.addWidget(bb)
+        self.detect(filename)
+
+    def detect(self, fn):
+        try:
+            with segyio.open(fn, ignore_geometry=True) as f:
+                iv = f.bin[segyio.BinField.Interval]; 
+                if iv>0: self.sb_sr.setValue(iv/1000.0)
+        except: pass
+
+    def get_data(self):
+        m = 'h' if self.rb_h.isChecked() else ('m' if self.rb_m.isChecked() else 'n')
+        return {
+            'crs':self.cb_crs.currentText(), 'cdp_b':self.sb_cdp.value(), 'x_b':self.sb_x.value(), 'y_b':self.sb_y.value(),
+            'sc_m':m, 'sc_b':self.sb_sc.value(), 'mx':self.db_mx.value(), 'my':self.db_my.value(),
+            'sr':self.sb_sr.value(), 'all':self.chk.isChecked()
+        }
+
+# =============================================================================
+# 3. Data Object
+# =============================================================================
+class SeismicObject:
+    def __init__(self, fn, data, coords, cdps, sets):
+        self.filename = fn; self.name = os.path.basename(fn)
+        self.raw_data = data; self.real_coords = coords; self.cdps = cdps; self.settings = sets
+        self.trace_count = len(coords)
+        self.idx_coords = np.column_stack((np.arange(self.trace_count), np.zeros(self.trace_count)))
+        self.crs_name = sets.get('crs','Unknown')
+        self.horizons = {k:{'color':c,'points':[]} for k,c in [('H_A','yellow'),('H_B','cyan'),('H_C','lime')]}
+        self.shift_ms = 0; self.is_flipped = False; self.contrast = 980
+        self.composite_data = None; self.intersections = []
+
+# =============================================================================
+# 4. Separate Section Window (Pop-up)
+# =============================================================================
+class SeismicSectionWindow(QMainWindow):
+    request_file_change = Signal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Seismic Viewer")
+        self.resize(1000, 600)
+        cen = QWidget(); self.setCentralWidget(cen); lay = QVBoxLayout(cen)
+        
+        # Navigation
+        h_nav = QHBoxLayout()
+        self.btn_prev = QPushButton("◀"); self.btn_prev.clicked.connect(self.go_prev)
+        self.btn_next = QPushButton("▶"); self.btn_next.clicked.connect(self.go_next)
+        self.combo_files = QComboBox()
+        self.combo_files.currentIndexChanged.connect(self.on_combo_changed)
+        h_nav.addWidget(self.btn_prev); h_nav.addWidget(self.combo_files, 1); h_nav.addWidget(self.btn_next)
+        lay.addLayout(h_nav)
+        
+        self.fig = Figure(facecolor='#F0F0F0'); self.cv = FigureCanvasQTAgg(self.fig)
+        lay.addWidget(NavigationToolbar2QT(self.cv, cen)); lay.addWidget(self.cv)
+        self.ax = self.fig.add_subplot(111); self.ax.set_facecolor('black')
+        
+        self.cv.mpl_connect('button_press_event', self.on_click)
+        self.cv.mpl_connect('scroll_event', self.on_scroll)
+        self.cv.mpl_connect('motion_notify_event', self.on_move)
+        
+        self.status = QStatusBar(); self.setStatusBar(self.status)
+        self.current_obj = None; self.active_hor = "H_A"
+        self.cross_v = None; self.cross_h = None; self.show_cdp = False; self.internal_change = False
+
+    def update_file_list(self, names, current_idx):
+        self.internal_change = True
+        self.combo_files.clear(); self.combo_files.addItems(names)
+        if 0 <= current_idx < len(names): self.combo_files.setCurrentIndex(current_idx)
+        self.internal_change = False
+        self.btn_prev.setEnabled(current_idx > 0); self.btn_next.setEnabled(current_idx < len(names) - 1)
+
+    def on_combo_changed(self, idx):
+        if not self.internal_change and idx >= 0: self.request_file_change.emit(idx)
+    def go_prev(self):
+        idx = self.combo_files.currentIndex()
+        if idx > 0: self.combo_files.setCurrentIndex(idx - 1)
+    def go_next(self):
+        idx = self.combo_files.currentIndex()
+        if idx < self.combo_files.count() - 1: self.combo_files.setCurrentIndex(idx + 1)
+    def set_active_horizon(self, key): self.active_hor = key
+
+    # --- [최적화 적용된 draw 함수] ---
+    def draw(self, obj):
+        self.current_obj = obj
+        if not obj: self.ax.clear(); self.cv.draw(); return
+        
+        full_data = obj.composite_data if obj.composite_data is not None else obj.raw_data
+        
+        # [최적화 1] 다운샘플링 (Decimation)
+        MAX_RES = 2000 
+        h, w = full_data.shape
+        dy = max(1, h // MAX_RES)
+        dx = max(1, w // MAX_RES)
+        d = full_data[::dy, ::dx]
+        
+        sr = obj.settings['sr']
+        shift_samples = int(obj.shift_ms / sr)
+        
+        # Shift 처리 (다운샘플링된 비율 고려)
+        if shift_samples != 0:
+            s_shift = int(shift_samples / dy)
+            d = np.roll(d, s_shift, 0)
+            if s_shift > 0: d[:s_shift, :] = 0
+            
+        if obj.is_flipped: d = np.fliplr(d)
+        
+        self.ax.clear(); self.cross_v = None; self.cross_h = None
+        
+        abs_data = np.abs(d)
+        lim = 1.0 if np.max(abs_data)==0 else np.nanpercentile(abs_data, obj.contrast/10.0)
+        if lim==0: lim=1.0
+        
+        max_time = h * sr
+        
+        # [최적화 2] imshow extent 사용
+        self.ax.imshow(d, cmap='RdBu', aspect='auto', vmin=-lim, vmax=lim, 
+                       extent=[0, w, max_time, 0], interpolation='nearest')
+                       
+        self.ax.set_title(f"{obj.name}\nCRS: {obj.crs_name}"); self.ax.set_ylabel("TWT (ms)")
+        
+        if "Composite" in obj.name and hasattr(obj, 'intersections'):
+            for idx in obj.intersections:
+                px = (w-1)-idx if obj.is_flipped else idx
+                self.ax.axvline(x=px, color='black', lw=1.5)
+
+        if self.show_cdp and hasattr(obj, 'cdps') and "Composite" not in obj.name:
+            def format_cdp(x, p):
+                idx = int(round(x))
+                if 0 <= idx < w:
+                    real_idx = (w-1)-idx if obj.is_flipped else idx
+                    return str(obj.cdps[real_idx])
+                return ""
+            self.ax.xaxis.set_major_formatter(FuncFormatter(format_cdp))
+            self.ax.set_xlabel("CDP")
+        else:
+            self.ax.xaxis.set_major_formatter(FuncFormatter(lambda x,p: str(int(x))))
+            self.ax.set_xlabel("Trace Index")
+            
+        for k, v in obj.horizons.items():
+            if not v['points']: continue
+            p = np.array(v['points'])
+            x = (w-1)-p[:,0] if obj.is_flipped else p[:,0]
+            self.ax.plot(x, p[:,1]+obj.shift_ms, 'o-', c=v['color'], ms=4)
+            
+        self.cv.draw()
+
+    # --- [들여쓰기 수정된 on_scroll 함수] ---
+    def on_scroll(self, e):
+        if e.inaxes!=self.ax: return
+        sc = 1.2 if e.button=='down' else 1/1.2; xl, yl = self.ax.get_xlim(), self.ax.get_ylim()
+        w, h = xl[1]-xl[0], yl[1]-yl[0]
+        rx = (xl[1]-e.xdata)/w; ry = (yl[1]-e.ydata)/h
+        self.ax.set_xlim([e.xdata-w*sc*(1-rx), e.xdata+w*sc*rx])
+        self.ax.set_ylim([e.ydata-h*sc*(1-ry), e.ydata+h*sc*ry]); self.cv.draw_idle()
+
+    def on_click(self, e):
+        if not self.current_obj or e.inaxes!=self.ax: return
+        o = self.current_obj; nt = (o.composite_data if o.composite_data is not None else o.raw_data).shape[1]
+        ix = int(round(e.xdata)); rix = (nt-1)-ix if o.is_flipped else ix
+        if not (0<=rix<nt): return
+        pts = o.horizons[self.active_hor]['points']
+        if e.button==1: pts[:]=[p for p in pts if p[0]!=rix]; pts.append([rix, e.ydata-o.shift_ms]); pts.sort(key=lambda x:x[0])
+        elif e.button==3 and pts: pts.pop(np.argmin([abs(p[0]-rix) for p in pts]))
+        self.draw(o)
+
+    def on_move(self, e):
+        if not e.inaxes or not self.current_obj: return
+        if not self.cross_v:
+            self.cross_v = self.ax.axvline(x=e.xdata, color='red', lw=0.5, ls='--')
+            self.cross_h = self.ax.axhline(y=e.ydata, color='red', lw=0.5, ls='--')
+        else: self.cross_v.set_xdata([e.xdata]); self.cross_h.set_ydata([e.ydata])
+        self.cv.draw_idle()
+        o = self.current_obj; d = o.composite_data if o.composite_data is not None else o.raw_data
+        ix = int(round(e.xdata)); rix = (d.shape[1]-1)-ix if o.is_flipped else ix
+        msg = f"Trace: {ix} | Time: {e.ydata:.1f}ms"
+        if 0<=rix<d.shape[1]:
+            s_idx = int((e.ydata-o.shift_ms)/o.settings['sr'])
+            if 0<=s_idx<d.shape[0]: msg += f" | Amp: {d[s_idx, rix]:.2f}"
+            if hasattr(o,'cdps') and len(o.cdps)>rix: msg += f" | CDP: {o.cdps[rix]}"
+            if self.parent() and hasattr(self.parent(), 'update_map_cursor'):
+                self.parent().update_map_cursor(rix, o)
+        self.status.showMessage(msg)
+
+# =============================================================================
+# 5. Main Window
 # =============================================================================
 class SegyViewer(QMainWindow):
-    horizon_updated = Signal(str, dict)
-
-    def __init__(self, filename=None, horizons=None, coord_type="CDP"):
-        super().__init__()
-        self.setWindowTitle(f"Woo Interpreter - {os.path.basename(filename) if filename else 'New'}")
-        self.resize(1400, 900)
-
-        self.filename = filename
-        self.coord_type = coord_type
-        self.current_data = None
-        self.horizons = horizons if horizons else {
-            'Horizon A': {'color': 'yellow', 'points': []},
-            'Horizon B': {'color': 'cyan', 'points': []},
-            'Horizon C': {'color': 'lime', 'points': []}
-        }
-        self.active_layer = 'Horizon A'
-        
-        # 3D Variables
-        self.is_3d = False
-        self.segy_handle = None
-        self.ilines = []
-        self.xlines = []
-        self.current_slice_type = "Inline"
-
-        # Rendering
-        self.limit_val = 1.0
-        self.line_objs = {}
-        self.scat_objs = {}
-        self.real_trace_indices = None
-        self.cache_x = None
-
-        self.init_ui()
-        if self.filename:
-            self.load_from_path(self.filename)
-
-    def init_ui(self):
-        main_widget = QWidget()
-        self.setCentralWidget(main_widget)
-        main_layout = QHBoxLayout(main_widget)
-
-        # Sidebar
-        sidebar = QWidget()
-        sidebar.setFixedWidth(320)
-        sidebar_layout = QVBoxLayout(sidebar)
-        sidebar_layout.setAlignment(Qt.AlignTop)
-        main_layout.addWidget(sidebar)
-
-        # 3D Controls
-        self.group_3d = QGroupBox("3D Slice Control")
-        self.group_3d.setVisible(False)
-        layout_3d = QVBoxLayout()
-        
-        type_layout = QHBoxLayout()
-        self.combo_slice_type = QComboBox()
-        self.combo_slice_type.addItems(["Inline", "Crossline"])
-        self.combo_slice_type.currentTextChanged.connect(self.on_slice_type_change)
-        type_layout.addWidget(QLabel("Type:"))
-        type_layout.addWidget(self.combo_slice_type)
-        layout_3d.addLayout(type_layout)
-
-        self.slider_slice = QSlider(Qt.Horizontal)
-        self.slider_slice.valueChanged.connect(self.on_slice_change)
-        layout_3d.addWidget(self.slider_slice)
-        
-        self.lbl_slice_info = QLabel("No Data")
-        layout_3d.addWidget(self.lbl_slice_info)
-        self.group_3d.setLayout(layout_3d)
-        sidebar_layout.addWidget(self.group_3d)
-
-        # Interpretation Tools
-        sidebar_layout.addWidget(QLabel("<b>--- Interpretation ---</b>"))
-        self.combo_layer = QComboBox()
-        self.combo_layer.addItems(list(self.horizons.keys()))
-        self.combo_layer.currentTextChanged.connect(self.on_layer_change)
-        sidebar_layout.addWidget(self.combo_layer)
-
-        btn_io_layout = QHBoxLayout()
-        btn_import = QPushButton("📂 Import")
-        btn_import.clicked.connect(self.import_horizon_csv)
-        btn_export = QPushButton("💾 Export")
-        btn_export.clicked.connect(self.save_horizon)
-        btn_io_layout.addWidget(btn_import)
-        btn_io_layout.addWidget(btn_export)
-        sidebar_layout.addLayout(btn_io_layout)
-
-        btn_clear = QPushButton("📍 Clear Layer")
-        btn_clear.clicked.connect(self.clear_horizon)
-        btn_clear.setStyleSheet("background-color: #e74c3c; color: white;")
-        sidebar_layout.addWidget(btn_clear)
-
-        self.lbl_hor_info = QLabel("Status: Ready")
-        sidebar_layout.addWidget(self.lbl_hor_info)
-
-        # Display Settings
-        sidebar_layout.addSpacing(15)
-        sidebar_layout.addWidget(QLabel("<b>--- Display ---</b>"))
-        
-        self.chk_auto_fit = QCheckBox("Auto Fit Mode")
-        self.chk_auto_fit.setChecked(True)
-        self.chk_auto_fit.toggled.connect(self.toggle_aspect)
-        sidebar_layout.addWidget(self.chk_auto_fit)
-
-        sidebar_layout.addWidget(QLabel("Contrast (Clip %)"))
-        self.slider_clip = QSlider(Qt.Horizontal)
-        self.slider_clip.setRange(800, 999) 
-        self.slider_clip.setValue(980)
-        self.slider_clip.valueChanged.connect(lambda: self.update_contrast_only())
-        sidebar_layout.addWidget(self.slider_clip)
-
-        # Plot Area
-        plot_container = QWidget()
-        plot_layout = QVBoxLayout(plot_container)
-        
-        self.fig = Figure(figsize=(5, 4), dpi=100)
-        self.canvas = FigureCanvasQTAgg(self.fig)
-        self.toolbar = NavigationToolbar2QT(self.canvas, self)
-        
-        plot_layout.addWidget(self.toolbar)
-        plot_layout.addWidget(self.canvas)
-        main_layout.addWidget(plot_container)
-
-        self.canvas.mpl_connect('button_press_event', self.on_mouse_action)
-        self.ax = self.fig.add_subplot(111)
-
-    def closeEvent(self, event):
-        if self.segy_handle: self.segy_handle.close()
-        event.accept()
-
-    def load_from_path(self, path):
-        try:
-            self.segy_handle = segyio.open(path, "r", strict=True)
-            self.is_3d = True
-            self.ilines = self.segy_handle.ilines
-            self.xlines = self.segy_handle.xlines
-            self.group_3d.setVisible(True)
-            self.update_3d_controls()
-            self.load_slice(self.ilines[len(self.ilines)//2], "Inline")
-        except Exception:
-            self.is_3d = False
-            self.group_3d.setVisible(False)
-            if self.segy_handle: self.segy_handle.close(); self.segy_handle = None
-            self.load_2d_data(path)
-
-    def update_3d_controls(self):
-        arr = self.ilines if self.current_slice_type == "Inline" else self.xlines
-        self.slider_slice.blockSignals(True)
-        self.slider_slice.setRange(0, len(arr)-1)
-        self.slider_slice.setValue(len(arr)//2)
-        self.slider_slice.blockSignals(False)
-
-    def on_slice_type_change(self, text):
-        self.current_slice_type = text
-        self.update_3d_controls()
-        self.on_slice_change(self.slider_slice.value())
-
-    def on_slice_change(self, idx):
-        target_arr = self.ilines if self.current_slice_type == "Inline" else self.xlines
-        if idx < 0 or idx >= len(target_arr): return
-        actual_line = target_arr[idx]
-        self.lbl_slice_info.setText(f"{self.current_slice_type}: {actual_line}")
-        self.load_slice(actual_line, self.current_slice_type)
-
-    def load_slice(self, line_no, mode):
-        if not self.segy_handle: return
-        try:
-            if mode == "Inline":
-                data = self.segy_handle.iline[line_no]
-                self.real_trace_indices = self.xlines
-            else:
-                data = self.segy_handle.xline[line_no]
-                self.real_trace_indices = self.ilines
-            
-            self.current_data = data.T
-            self.cache_x = np.arange(len(self.real_trace_indices)) # Simple Index mapping for 3D
-            self.full_redraw()
-        except Exception as e:
-            print(f"Slice Load Error: {e}")
-
-    def load_2d_data(self, path):
-        try:
-            with segyio.open(path, "r", ignore_geometry=True) as f:
-                total_traces = f.tracecount
-                step = max(1, total_traces // 5000)
-                indices = list(range(0, total_traces, step))
-                self.real_trace_indices = np.array(indices)
-                self.current_data = segyio.tools.collect(f.trace[::step]).T
-                
-                scalars = f.attributes(segyio.TraceField.SourceGroupScalar)[0:1]
-                scalar_val = float(scalars[0]) if len(scalars) > 0 else 1.0
-                if scalar_val < 0: scalar_val = 1.0 / abs(scalar_val)
-                elif scalar_val == 0: scalar_val = 1.0
-                
-                xk = segyio.TraceField.CDP_X if self.coord_type == "CDP" else segyio.TraceField.SourceX
-                self.cache_x = f.attributes(xk)[::step].astype(float) * scalar_val
-            
-            self.full_redraw()
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"2D Load Failed: {e}")
-
-    def full_redraw(self):
-        if self.current_data is None: return
-        self.ax.clear()
-        
-        clip_pct = self.slider_clip.value() / 10.0
-        sample_data = self.current_data[::5, ::5]
-        limit = np.nanpercentile(np.absolute(sample_data), clip_pct)
-        if limit == 0: limit = 1.0
-        self.limit_val = limit
-        
-        n_samples, n_traces = self.current_data.shape
-        self.extent = [0, n_traces, n_samples * 2.0, 0] # 2ms sampling default
-        
-        self.im_obj = self.ax.imshow(self.current_data, cmap="RdBu", 
-                                     vmin=-limit, vmax=limit,
-                                     aspect='auto', extent=self.extent, interpolation='nearest')
-        
-        self.ax.set_ylabel("Time (ms)")
-        self.ax.set_xlabel("Trace / Inline / Crossline")
-        
-        self.update_aspect_only(draw=False)
-        self.draw_horizons_only(draw=False)
-        self.canvas.draw()
-
-    def update_aspect_only(self, draw=True):
-        if self.chk_auto_fit.isChecked(): self.ax.set_aspect('auto')
-        if draw: self.canvas.draw_idle()
-
-    def update_contrast_only(self):
-        if not self.im_obj: return
-        clip_pct = self.slider_clip.value() / 10.0
-        limit = np.nanpercentile(np.absolute(self.current_data[::5, ::5]), clip_pct)
-        if limit == 0: limit = 1.0
-        self.im_obj.set_clim(-limit, limit)
-        self.canvas.draw_idle()
-
-    def toggle_aspect(self, checked): self.update_aspect_only()
-
-    def draw_horizons_only(self, draw=True):
-        if self.real_trace_indices is None: return
-        for obj in list(self.line_objs.values()) + list(self.scat_objs.values()):
-            try: obj.remove()
-            except: pass
-        self.line_objs, self.scat_objs = {}, {}
-
-        for name, data in self.horizons.items():
-            if not data['points']: continue
-            p_arr = np.array(data['points'])
-            saved_indices = p_arr[:, 3]
-            display_indices = np.searchsorted(self.real_trace_indices, saved_indices)
-            valid_mask = (display_indices < len(self.real_trace_indices)) & \
-                         (self.real_trace_indices[np.clip(display_indices, 0, len(self.real_trace_indices)-1)] == saved_indices)
-            
-            if np.any(valid_mask):
-                x_plot = display_indices[valid_mask]
-                y_plot = p_arr[valid_mask, 2]
-                self.scat_objs[name] = self.ax.plot(x_plot, y_plot, 'o', color=data['color'], markersize=4)[0]
-                if len(x_plot) >= 2:
-                    self.line_objs[name] = self.ax.plot(x_plot, y_plot, color=data['color'], linewidth=1.5)[0]
-        if draw: self.canvas.draw_idle()
-
-    def on_mouse_action(self, event):
-        if event.inaxes != self.ax or self.toolbar.mode != '': return
-        if not event.xdata or not event.ydata: return
-        
-        display_idx = int(round(event.xdata))
-        twt = event.ydata
-        pts_list = self.horizons[self.active_layer]['points']
-        changed = False
-
-        if event.button == 1: # Left Click
-            if 0 <= display_idx < len(self.real_trace_indices):
-                real_idx = self.real_trace_indices[display_idx]
-                x_val = self.cache_x[display_idx] if self.cache_x is not None else 0
-                pts_list.append([x_val, 0, twt, real_idx]) # Y는 임시 0
-                pts_list.sort(key=lambda x: x[3])
-                changed = True
-
-        elif event.button == 3: # Right Click
-             if pts_list and 0 <= display_idx < len(self.real_trace_indices):
-                target_real = self.real_trace_indices[display_idx]
-                dists = [abs(p[3] - target_real) for p in pts_list]
-                if dists and min(dists) < 5:
-                    pts_list.pop(np.argmin(dists))
-                    changed = True
-        
-        if changed:
-            self.update_status()
-            self.draw_horizons_only()
-            self.horizon_updated.emit(self.filename, self.horizons)
-
-    def on_layer_change(self, text): self.active_layer = text
-    def update_status(self):
-        status_txt = " | ".join([f"{k}:{len(v['points'])}" for k, v in self.horizons.items()])
-        self.lbl_hor_info.setText(status_txt)
-
-    def clear_horizon(self):
-        self.horizons[self.active_layer]['points'] = []
-        self.update_status(); self.draw_horizons_only()
-        self.horizon_updated.emit(self.filename, self.horizons)
-
-    def save_horizon(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Save", "", "CSV(*.csv)")
-        if path:
-            with open(path, 'w', newline='') as f:
-                f.write("Layer,X,Y,TWT,TraceIdx\n")
-                for n, d in self.horizons.items():
-                    for p in d['points']: f.write(f"{n},{p[0]},{p[1]},{p[2]},{p[3]}\n")
-            QMessageBox.information(self, "Success", "Export Complete.")
-
-    def import_horizon_csv(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Import", "", "CSV(*.csv)")
-        if path:
-            try:
-                with open(path, 'r') as f:
-                    reader = csv.DictReader(f)
-                    for row in reader:
-                        layer = row['Layer'].strip()
-                        if layer in self.horizons:
-                            self.horizons[layer]['points'].append(
-                                [float(row['X']), float(row['Y']), float(row['TWT']), int(float(row['TraceIdx']))]
-                            )
-                self.update_status(); self.draw_horizons_only()
-                self.horizon_updated.emit(self.filename, self.horizons)
-            except Exception as e: QMessageBox.critical(self, "Error", str(e))
-
-# =============================================================================
-# 3. 프로젝트 매니저 (지도 및 좌표 통합 관리)
-# =============================================================================
-class ProjectManager(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Seismic Base Map (Project Manager)")
-        self.resize(1200, 900)
+        self.setWindowTitle("PySide6 Seismic Viewer + GIS")
+        self.resize(1600, 900)
+        self.seismic_objects = {}; self.current_obj = None; self.waypoints = []
+        self.shapefile_layers = [] 
         
-        self.survey_lines = {}
-        self.line_plots = {}
-        self.horizon_plots = {}
+        self.map_marker = None; self.snap_marker = None; self.snap_coord = None
+        self.map_kdtree = None; self.map_coords_cache = None; self.map_index_lookup = []
         
-        # 기본 좌표계 설정: UTM Zone 50S (E.Kalimantan)
-        self.current_epsg = "EPSG:32750" 
-        self.transformer = Transformer.from_crs(self.current_epsg, "EPSG:3857", always_xy=True)
-
+        self.extra_windows = [] 
+        
+        self.win_section = SeismicSectionWindow(self)
+        self.win_section.request_file_change.connect(self.on_section_file_change)
+        self.win_section.show()
+        
+        self.status = QStatusBar(); self.setStatusBar(self.status)
         self.init_ui()
 
     def init_ui(self):
-        main_widget = QWidget()
-        self.setCentralWidget(main_widget)
-        main_layout = QVBoxLayout(main_widget)
-
-        # Toolbar
-        toolbar = QHBoxLayout()
+        main = QWidget(); self.setCentralWidget(main); layout = QHBoxLayout(main)
         
-        btn_load = QPushButton("📂 Load SEGY")
-        btn_load.clicked.connect(self.add_files)
-        toolbar.addWidget(btn_load)
+        sidebar = QWidget(); sidebar.setFixedWidth(320); sl = QVBoxLayout(sidebar); layout.addWidget(sidebar)
+        sl.addWidget(QPushButton("📂 Load SEGY", clicked=self.load_segy))
         
-        btn_save = QPushButton("💾 Save")
-        btn_save.clicked.connect(self.save_project)
-        toolbar.addWidget(btn_save)
-
-        btn_open = QPushButton("📂 Open")
-        btn_open.clicked.connect(self.load_project)
-        toolbar.addWidget(btn_open)
-
-        # [UTM Zone Selector]
-        toolbar.addSpacing(20)
-        toolbar.addWidget(QLabel("<b>UTM Zone:</b>"))
-        self.combo_zone = QComboBox()
-        self.combo_zone.setMinimumWidth(180)
-        self.combo_zone.addItem("Zone 50S (E.Kalimantan)", "EPSG:32750") 
-        self.combo_zone.addItem("Zone 51S (Sulawesi)", "EPSG:32751")
-        self.combo_zone.addItem("Zone 49S (W.Kalimantan)", "EPSG:32749")
-        self.combo_zone.addItem("Zone 50N (North Hemi)", "EPSG:32650")
-        self.combo_zone.currentIndexChanged.connect(self.change_crs_zone)
-        toolbar.addWidget(self.combo_zone)
-
-        # Map Style
-        toolbar.addSpacing(20)
-        toolbar.addWidget(QLabel("Map:"))
-        self.combo_map = QComboBox()
-        self.combo_map.addItems(["OpenStreetMap", "Satellite (Esri)", "Toner Lite"])
-        self.combo_map.currentTextChanged.connect(self.update_map_background)
-        toolbar.addWidget(self.combo_map)
-
-        # Layer View
-        toolbar.addSpacing(10)
-        toolbar.addWidget(QLabel("Layer:"))
-        self.combo_viz_layer = QComboBox()
-        self.combo_viz_layer.addItems(["None", "Horizon A", "Horizon B", "Horizon C"])
-        self.combo_viz_layer.currentTextChanged.connect(self.draw_visualization)
-        toolbar.addWidget(self.combo_viz_layer)
-
-        toolbar.addStretch()
-        main_layout.addLayout(toolbar)
-
-        # Map Canvas
-        self.fig = Figure(figsize=(10, 8), dpi=100)
-        self.canvas = FigureCanvasQTAgg(self.fig)
-        self.mpl_toolbar = NavigationToolbar2QT(self.canvas, self)
+        btn_shp = QPushButton("🌍 Load Shapefile", clicked=self.load_shapefile)
+        if not HAS_GEOPANDAS: 
+            btn_shp.setEnabled(False)
+            btn_shp.setToolTip("pip install geopandas required")
+        sl.addWidget(btn_shp)
         
-        main_layout.addWidget(self.mpl_toolbar)
-        main_layout.addWidget(self.canvas)
-
-        self.ax = self.fig.add_subplot(111)
-        self.divider = make_axes_locatable(self.ax)
-        self.cax = self.divider.append_axes("right", size="3%", pad=0.1)
-
-        self.canvas.mpl_connect('pick_event', self.on_line_pick)
-        self.reset_map_view()
-
-    def reset_map_view(self):
-        self.ax.clear()
-        self.cax.clear(); self.cax.axis('off')
-        self.ax.set_axis_off()
-        self.line_plots = {}
-        self.horizon_plots = {}
-        self.canvas.draw()
-
-    def change_crs_zone(self, index):
-        """ UTM Zone 변경 시 좌표 재계산 """
-        new_epsg = self.combo_zone.currentData()
-        self.current_epsg = new_epsg
-        self.transformer = Transformer.from_crs(new_epsg, "EPSG:3857", always_xy=True)
-        print(f"CRS Changed to {new_epsg}")
-
-        # 모든 라인 다시 변환 (원본 UTM 사용)
-        for fname, d in self.survey_lines.items():
-            if "UTM" in d.get('type', ''):
-                new_mx, new_my = self.transformer.transform(d['raw_x'], d['raw_y'])
-                d['x'] = new_mx
-                d['y'] = new_my
+        sl.addWidget(QLabel("<b>Loaded Lines:</b>"))
+        self.lst = QListWidget(); self.lst.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.lst.itemSelectionChanged.connect(self.sel_item)
+        self.lst.itemChanged.connect(self.chk_item); sl.addWidget(self.lst)
         
-        self.update_map()
-
-    def add_files(self):
-        paths, _ = QFileDialog.getOpenFileNames(self, "Select SEGY", "", "SEGY Files (*.sgy *.segy)")
-        if not paths: return
-        for path in paths:
-            self.process_segy_file_with_coords(path)
-        self.update_map()
-
-    def process_segy_file_with_coords(self, filepath):
-        if not os.path.exists(filepath): return
-        fname = os.path.basename(filepath)
+        sl.addWidget(QPushButton("➕ New Viewer (Multi-Window)", clicked=self.spawn_new_viewer))
         
+        h_vis = QHBoxLayout()
+        h_vis.addWidget(QPushButton("👁️ Select Only", clicked=self.show_only_selected))
+        h_vis.addWidget(QPushButton("✅ All On", clicked=self.show_all_files))
+        h_vis.addWidget(QPushButton("⬜ All Off", clicked=self.hide_all_files))
+        sl.addLayout(h_vis)
+
+        h_del = QHBoxLayout()
+        h_del.addWidget(QPushButton("🗑️ Remove", clicked=self.remove_item))
+        h_del.addWidget(QPushButton("🧹 Clear All", clicked=self.clear_all_files))
+        sl.addLayout(h_del)
+        
+        hp = QHBoxLayout(); hp.addWidget(QPushButton("Save", clicked=self.save_p)); hp.addWidget(QPushButton("Load", clicked=self.load_p))
+        sl.addLayout(hp); sl.addSpacing(10)
+        
+        gc = QGroupBox("Display"); gl = QVBoxLayout(gc)
+        gl.addWidget(QLabel("Contrast:")); self.sl_c = QSlider(Qt.Horizontal); self.sl_c.setRange(800,999); self.sl_c.setValue(980)
+        self.sl_c.valueChanged.connect(self.upd_view); gl.addWidget(self.sl_c)
+        
+        hk = QHBoxLayout()
+        self.ck_f = QCheckBox("Flip L/R"); self.ck_f.toggled.connect(self.upd_view); hk.addWidget(self.ck_f)
+        self.ck_c = QCheckBox("Show CDP"); self.ck_c.toggled.connect(self.upd_view); hk.addWidget(self.ck_c)
+        gl.addLayout(hk)
+        
+        self.cb_h = QComboBox(); self.cb_h.addItems(['H_A','H_B','H_C'])
+        self.cb_h.currentTextChanged.connect(lambda t: self.win_section.set_active_horizon(t))
+        self.win_section.set_active_horizon('H_A')
+        gl.addWidget(self.cb_h); gl.addWidget(QPushButton("Clear Horizon", clicked=self.clr_hor))
+        
+        hs = QHBoxLayout(); hs.addWidget(QLabel("Shift:")); self.sb_s = QSpinBox(); self.sb_s.setRange(-5000,5000); self.sb_s.setSingleStep(4)
+        self.sb_s.valueChanged.connect(self.upd_view); hs.addWidget(self.sb_s)
+        gl.addLayout(hs); sl.addWidget(gc); self.grp_ctrl = gc; gc.setEnabled(False)
+        sl.addStretch()
+        
+        map_area = QWidget(); lm = QVBoxLayout(map_area); layout.addWidget(map_area, stretch=1)
+        h_mc = QHBoxLayout()
+        
+        self.rb_sel = QRadioButton("Select Line"); self.rb_sel.setChecked(True)
+        self.rb_draw = QRadioButton("Draw Path")
+        bg_map = QButtonGroup(self); bg_map.addButton(self.rb_sel); bg_map.addButton(self.rb_draw)
+        h_mc.addWidget(self.rb_sel); h_mc.addWidget(self.rb_draw)
+        
+        h_mc.addWidget(QPushButton("✂️ Extract Composite", clicked=self.create_composite))
+        h_mc.addWidget(QPushButton("❌ Clear Path", clicked=self.clr_path))
+        self.ck_fix = QCheckBox("Force Index"); self.ck_fix.toggled.connect(self.draw_map); h_mc.addWidget(self.ck_fix)
+        
+        h_mc.addStretch(); lm.addLayout(h_mc)
+        
+        self.fig_m = Figure(); self.cv_m = FigureCanvasQTAgg(self.fig_m)
+        lm.addWidget(NavigationToolbar2QT(self.cv_m, map_area)); lm.addWidget(self.cv_m)
+        self.ax_m = self.fig_m.add_subplot(111); 
+        self.cv_m.mpl_connect('button_press_event', self.on_map_click)
+        self.cv_m.mpl_connect('motion_notify_event', self.on_map_hover)
+
+    def load_shapefile(self):
+        if not HAS_GEOPANDAS: return
+        fn, _ = QFileDialog.getOpenFileName(self, "Open Shapefile", "", "Shapefile (*.shp)")
+        if fn:
+            try:
+                gdf = gpd.read_file(fn)
+                import random
+                color = "#%06x" % random.randint(0, 0xFFFFFF)
+                self.shapefile_layers.append({'name': os.path.basename(fn), 'data': gdf, 'color': color})
+                self.status.showMessage(f"Loaded Shapefile: {os.path.basename(fn)}", 3000)
+                self.draw_map()
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to load SHP: {str(e)}")
+
+    def spawn_new_viewer(self):
+        new_win = SeismicSectionWindow(None)
+        new_win.setAttribute(Qt.WA_DeleteOnClose)
+        if self.current_obj:
+            new_win.draw(self.current_obj)
+            names = [self.lst.item(i).text() for i in range(self.lst.count())]
+            curr = self.lst.currentRow()
+            new_win.update_file_list(names, curr)
+        new_win.show()
+        self.extra_windows.append(new_win) 
+
+    def sync_file_list(self):
+        names = [self.lst.item(i).text() for i in range(self.lst.count())]
+        curr = self.lst.currentRow()
+        self.win_section.update_file_list(names, curr)
+
+    def on_section_file_change(self, idx):
+        if 0 <= idx < self.lst.count(): self.lst.setCurrentRow(idx)
+
+    def on_map_click(self, e):
+        if e.inaxes!=self.ax_m: return
+        
+        if self.rb_sel.isChecked():
+            if not self.map_kdtree: return
+            dist, idx = self.map_kdtree.query([e.xdata, e.ydata])
+            xlim = self.ax_m.get_xlim(); threshold = (xlim[1] - xlim[0]) * 0.05
+            if dist < threshold:
+                file_key = self.map_index_lookup[idx]
+                for r in range(self.lst.count()):
+                    if self.lst.item(r).data(Qt.UserRole) == file_key:
+                        self.lst.setCurrentRow(r)
+                        break
+        else:
+            if e.button==1: 
+                final_x, final_y = self.snap_coord if self.snap_coord else (e.xdata, e.ydata)
+                self.waypoints.append([final_x, final_y])
+            elif e.button==3 and self.waypoints: self.waypoints.pop()
+            self.draw_map()
+
+    # --- [최적화 적용된 draw_map 함수] ---
+    def draw_map(self):
+        self.ax_m.clear(); fix=self.ck_fix.isChecked(); yoff=0; self.map_marker=None; self.snap_marker=None
+        self.map_coords_cache = []; all_coords_list = []; self.map_index_lookup = []
+        
+        if not fix and HAS_GEOPANDAS: 
+            for layer in self.shapefile_layers:
+                try:
+                    # [최적화 3] rasterized=True 사용
+                    layer['data'].plot(ax=self.ax_m, color=layer['color'], edgecolor='black', alpha=0.3, linewidth=1, rasterized=True)
+                except Exception: pass
+
+        for i in range(self.lst.count()):
+            it = self.lst.item(i)
+            if it.checkState()==Qt.Checked:
+                key = it.data(Qt.UserRole)
+                o = self.seismic_objects[key]
+                if "Composite" in o.name: continue
+                c = o.idx_coords.copy() if fix else o.real_coords
+                if fix: c[:,1]+=yoff; yoff+=50
+                
+                # [최적화 4] Scatter 대신 Plot 사용 + 다운샘플링
+                step = max(1, len(c)//3000)
+                self.ax_m.plot(c[::step,0], c[::step,1], '-', lw=1, alpha=0.8, label=o.name)
+                
+                all_coords_list.append(c)
+                self.map_index_lookup.extend([key] * len(c))
+                
+        if all_coords_list and HAS_SCIPY:
+            self.map_coords_cache = np.vstack(all_coords_list)
+            self.map_kdtree = cKDTree(self.map_coords_cache)
+        else: self.map_kdtree = None
+
+        if self.waypoints: 
+            wp=np.array(self.waypoints)
+            self.ax_m.plot(wp[:,0], wp[:,1], 'r-o', lw=2)
+        
+        self.ax_m.xaxis.set_major_formatter(StrMethodFormatter('{x:,.0f}'))
+        self.ax_m.yaxis.set_major_formatter(StrMethodFormatter('{x:,.0f}'))
+        
+        self.fig_m.tight_layout()
+        self.cv_m.draw()
+
+    def load_segy(self):
+        fs, _ = QFileDialog.getOpenFileNames(self, "Open", "", "SEGY (*.sgy *.segy)")
+        if not fs: return
+        sets = None
+        for fn in fs:
+            if fn in self.seismic_objects: continue
+            if not sets:
+                d = SegyHeaderDialog(fn, self)
+                if d.exec()!=QDialog.Accepted: continue
+                t = d.get_data(); 
+                if t['all']: sets = t
+            self.read_file(fn, sets if sets else t)
+        self.draw_map()
+
+    def read_file(self, fn, s):
         try:
-            with segyio.open(filepath, "r", ignore_geometry=True) as f:
-                # 1. Scalar
-                scalars = f.attributes(segyio.TraceField.SourceGroupScalar)[0:1]
-                scalar = float(scalars[0]) if len(scalars) > 0 else 1.0
-                if scalar < 0: scalar = 1.0 / abs(scalar)
-                elif scalar == 0: scalar = 1.0
-                
-                # 2. Coordinates
-                trace_count = f.tracecount
-                step = max(1, trace_count // 500)
-                
-                src_x = f.attributes(segyio.TraceField.SourceX)[::step].astype(float) * scalar
-                src_y = f.attributes(segyio.TraceField.SourceY)[::step].astype(float) * scalar
-                cdp_x = f.attributes(segyio.TraceField.CDP_X)[::step].astype(float) * scalar
-                cdp_y = f.attributes(segyio.TraceField.CDP_Y)[::step].astype(float) * scalar
-                
-                final_x, final_y = None, None
-                coord_type = "Unknown"
-                
-                # 3. Smart Detection
-                avg_src_x = np.mean(np.abs(src_x))
-                avg_cdp_x = np.mean(np.abs(cdp_x))
+            with segyio.open(fn, ignore_geometry=True) as f:
+                d = f.trace.raw[:].T
+                rx = f.attributes(s['x_b'])[:]; ry = f.attributes(s['y_b'])[:]
+                try: cdps = f.attributes(s['cdp_b'])[:]
+                except: cdps = np.arange(len(rx))+1
+                if s['sc_m']=='n': rc=np.column_stack((rx,ry))
+                elif s['sc_m']=='m': rc=np.column_stack((rx*s['mx'], ry*s['my']))
+                else:
+                    sc=f.attributes(s['sc_b'])[:]; sc=np.where(sc==0,1,sc)
+                    xf=rx.astype(float); yf=ry.astype(float)
+                    m=sc>0; xf[m]*=sc[m]; yf[m]*=sc[m]
+                    d_=sc<0; dv=np.abs(sc[d_]); xf[d_]/=dv; yf[d_]/=dv
+                    rc=np.column_stack((xf,yf))
+                o = SeismicObject(fn, d, rc, cdps, s)
+                self.seismic_objects[fn] = o
+                it = QListWidgetItem(f"[{o.crs_name[:8]}] {o.name}")
+                it.setData(Qt.UserRole, fn); it.setCheckState(Qt.Checked)
+                self.lst.addItem(it)
+        except Exception as e: QMessageBox.critical(self, "Err", str(e))
+        self.sync_file_list()
 
-                # Case A: Lat/Lon (<= 180)
-                if 0.1 < avg_src_x <= 180.0:
-                    final_x, final_y = src_x, src_y
-                    coord_type = "Source (Lat/Lon)"
-                    # LatLon -> WebMercator
-                    transformer = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
-                    mx, my = transformer.transform(final_x, final_y)
-
-                # Case B: UTM (> 10000)
-                elif avg_src_x > 10000:
-                    final_x, final_y = src_x, src_y
-                    coord_type = "Source (UTM)"
-                    # Use currently selected Zone
-                    mx, my = self.transformer.transform(final_x, final_y)
-                    
-                elif avg_cdp_x > 10000:
-                    final_x, final_y = cdp_x, cdp_y
-                    coord_type = "CDP (UTM)"
-                    mx, my = self.transformer.transform(final_x, final_y)
-                
-                if final_x is None:
-                    print(f"Skipping {fname}: No valid coords.")
-                    return
-                
-                print(f"Loaded {fname}: {coord_type}")
-                
-                horizons = self.get_default_horizons()
-                self.survey_lines[fname] = {
-                    'path': filepath, 
-                    'x': mx, 
-                    'y': my,
-                    'raw_x': final_x, # Save Raw for dynamic switching
-                    'raw_y': final_y,
-                    'type': coord_type,
-                    'horizons': horizons
-                }
-
-        except Exception as e:
-            print(f"Error loading {fname}: {e}")
-
-    def get_default_horizons(self):
-        return {'Horizon A': {'color': 'yellow', 'points': []}, 
-                'Horizon B': {'color': 'cyan', 'points': []}, 
-                'Horizon C': {'color': 'lime', 'points': []}}
-
-    def update_map(self):
-        self.ax.clear()
+    def create_composite(self):
+        if len(self.waypoints)<2: return
+        if not HAS_SCIPY: QMessageBox.warning(self,"Warning","Install scipy"); return
+        use_idx=self.ck_fix.isChecked(); yoff=0; coords=[]; traces=[]; 
+        max_ns = 0
+        for i in range(self.lst.count()):
+            it = self.lst.item(i)
+            if it.checkState()==Qt.Checked:
+                o = self.seismic_objects[it.data(Qt.UserRole)]
+                if "Composite" in o.name: continue
+                if o.raw_data.shape[0] > max_ns: max_ns = o.raw_data.shape[0]
+                c = o.idx_coords.copy() if use_idx else o.real_coords
+                if use_idx: c[:,1]+=yoff; yoff+=50
+                coords.append(c); traces.append((o, len(c)))
         
-        for lid, d in self.survey_lines.items():
-            l, = self.ax.plot(d['x'], d['y'], label=lid, linewidth=2, color='blue', alpha=0.7, picker=5)
-            self.line_plots[l] = lid
-            if len(d['x']) > 0:
-                self.ax.text(d['x'][0], d['y'][0], lid[:10], fontsize=8, fontweight='bold', color='darkblue')
-
-        if self.survey_lines:
-            self.update_map_background(self.combo_map.currentText())
+        if not coords: return
+        tree = cKDTree(np.vstack(coords))
+        pts=[]; intersects=[]; cur=0
+        for i in range(len(self.waypoints)-1):
+            p1,p2 = np.array(self.waypoints[i]), np.array(self.waypoints[i+1])
+            dist = np.linalg.norm(p2-p1); steps = int(max(dist/25.0, 5)) 
+            seg = [p1+(p2-p1)*f for f in np.linspace(0,1,steps)]
+            pts.extend(seg); cur+=len(seg); intersects.append(cur-1)
         
-        self.ax.set_axis_off()
-        self.canvas.draw()
+        dists, idxs = tree.query(np.array(pts))
+        counts=[t[1] for t in traces]; cum=np.cumsum(counts); objs=[t[0] for t in traces]
+        final=[]
+        MAX_DIST = 2500.0
+        gap_count = 0
+        
+        for i, gi in enumerate(idxs):
+            if dists[i] > MAX_DIST: 
+                final.append(np.zeros(max_ns)); gap_count += 1
+            else:
+                fi = np.searchsorted(cum, gi, side='right')
+                li = gi if fi==0 else gi-cum[fi-1]
+                raw = objs[fi].raw_data[:, li]
+                if len(raw) == max_ns: final.append(raw)
+                elif len(raw) < max_ns:
+                    padded = np.zeros(max_ns); padded[:len(raw)] = raw; final.append(padded)
+                else: final.append(raw[:max_ns])
+            
+        name = f"Composite_{len(self.seismic_objects)}"; s = objs[0].settings.copy(); s['crs']="Composite"
+        co = SeismicObject(name, np.column_stack(final), pts, np.arange(len(pts)), s)
+        co.intersections = intersects
+        self.seismic_objects[name] = co
+        it=QListWidgetItem(f"✂️ {name}"); it.setData(Qt.UserRole, name); it.setCheckState(Qt.Checked)
+        self.lst.addItem(it); self.lst.setCurrentItem(it)
+        self.sync_file_list()
+        self.status.showMessage(f"Composite Created with {gap_count} gaps.", 5000)
 
-    def update_map_background(self, style_name):
-        if not self.survey_lines: return
-        provider = ctx.providers.OpenStreetMap.Mapnik
-        if style_name == "Satellite (Esri)": provider = ctx.providers.Esri.WorldImagery
-        elif style_name == "Toner Lite": provider = ctx.providers.CartoDB.Positron
+    def sel_item(self):
+        s = self.lst.selectedItems()
+        if not s: return
+        self.current_obj = self.seismic_objects[s[0].data(Qt.UserRole)]
+        self.grp_ctrl.setEnabled(True)
+        o = self.current_obj
+        self.sl_c.blockSignals(True); self.sl_c.setValue(o.contrast); self.sl_c.blockSignals(False)
+        self.ck_f.blockSignals(True); self.ck_f.setChecked(o.is_flipped); self.ck_f.blockSignals(False)
+        self.sb_s.blockSignals(True); self.sb_s.setValue(o.shift_ms); self.sb_s.blockSignals(False)
+        self.win_section.draw(o)
+        self.sync_file_list()
 
-        try:
-            ctx.add_basemap(self.ax, crs='EPSG:3857', source=provider)
-        except Exception as e:
-            print(f"Map Error: {e}")
-        self.canvas.draw()
-
-    def on_line_pick(self, event):
-        if event.artist in self.line_plots:
-            lid = self.line_plots[event.artist]
-            data = self.survey_lines[lid]
-            self.viewer_win = SegyViewer(filename=data['path'], horizons=data['horizons'], coord_type=data.get('type', 'CDP'))
-            self.viewer_win.horizon_updated.connect(self.on_horizon_update)
-            self.viewer_win.show()
-
-    def on_horizon_update(self, filepath, horizons):
-        fname = os.path.basename(filepath)
-        if fname in self.survey_lines:
-            self.survey_lines[fname]['horizons'] = horizons
-            self.draw_visualization()
-
-    def draw_visualization(self):
-        target = self.combo_viz_layer.currentText()
-        if target == 'None': 
-            self.update_map() # Clear contour
-            return
-
-        all_x, all_y, all_z = [], [], []
-        # (간략화된 예시) 실제 구현 시엔 픽킹된 포인트의 정확한 좌표 매핑 필요
-        # 현재는 데모용으로 Scatter만 지원
-        # ...
-
-    def save_project(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Save Project", "", "JSON Files (*.json)")
-        if path:
-            save_data = {fname: {'path': d['path'], 'horizons': d['horizons']} for fname, d in self.survey_lines.items()}
-            with open(path, 'w') as f: json.dump(save_data, f, indent=4)
-            QMessageBox.information(self, "Success", "Saved.")
-
-    def load_project(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Open Project", "", "JSON Files (*.json)")
-        if path:
-            with open(path, 'r') as f: loaded_data = json.load(f)
-            self.survey_lines = {}; self.reset_map_view()
-            for fname, data in loaded_data.items():
-                self.process_segy_file_with_coords(data['path'])
-                if fname in self.survey_lines:
-                    self.survey_lines[fname]['horizons'] = data['horizons']
-            self.update_map()
+    def chk_item(self, item): self.draw_map()
+    def upd_view(self):
+        if self.current_obj:
+            o = self.current_obj; o.contrast=self.sl_c.value(); o.is_flipped=self.ck_f.isChecked(); o.shift_ms=self.sb_s.value()
+            self.win_section.show_cdp=self.ck_c.isChecked()
+            self.win_section.draw(o)
+    def clr_hor(self):
+        if self.current_obj: self.current_obj.horizons[self.cb_h.currentText()]['points']=[]; self.win_section.draw(self.current_obj)
+    def remove_item(self):
+        sel = self.lst.selectedItems()
+        if not sel: return
+        key = sel[0].data(Qt.UserRole); del self.seismic_objects[key]
+        self.lst.takeItem(self.lst.row(sel[0]))
+        self.current_obj = None; self.grp_ctrl.setEnabled(False); self.win_section.draw(None); self.draw_map()
+        self.sync_file_list()
+    def clear_all_files(self):
+        if QMessageBox.question(self, "Clear", "Remove all?", QMessageBox.Yes|QMessageBox.No) == QMessageBox.Yes:
+            self.seismic_objects.clear(); self.lst.clear(); self.current_obj=None; self.waypoints=[]; self.shapefile_layers=[]
+            self.grp_ctrl.setEnabled(False); self.win_section.draw(None); self.draw_map()
+            self.sync_file_list()
+    def update_map_cursor(self, trace_idx, obj):
+        use_idx = self.ck_fix.isChecked()
+        if hasattr(obj, 'real_coords') and len(obj.real_coords) > trace_idx:
+            if use_idx: cx, cy = obj.idx_coords[trace_idx]
+            else: cx, cy = obj.real_coords[trace_idx]
+            if not self.map_marker: self.map_marker, = self.ax_m.plot([cx], [cy], 'rX', markersize=12, markeredgewidth=2)
+            else: self.map_marker.set_data([cx], [cy])
+            self.cv_m.draw_idle()
+    def clr_path(self): self.waypoints=[]; self.draw_map()
+    def show_only_selected(self):
+        sel = self.lst.selectedItems(); 
+        if not sel: return
+        target = sel[0].data(Qt.UserRole)
+        for i in range(self.lst.count()):
+            it = self.lst.item(i)
+            it.setCheckState(Qt.Checked if it.data(Qt.UserRole) == target else Qt.Unchecked)
+        self.draw_map()
+    def show_all_files(self):
+        for i in range(self.lst.count()): self.lst.item(i).setCheckState(Qt.Checked)
+        self.draw_map()
+    def hide_all_files(self):
+        for i in range(self.lst.count()): self.lst.item(i).setCheckState(Qt.Unchecked)
+        self.draw_map()
+    def on_map_hover(self, event):
+        if not event.inaxes or not self.map_kdtree: 
+            if self.snap_marker: self.snap_marker.set_data([], []); self.cv_m.draw_idle()
+            self.snap_coord = None; return
+        dist, idx = self.map_kdtree.query([event.xdata, event.ydata])
+        xlim = self.ax_m.get_xlim(); threshold = (xlim[1] - xlim[0]) * 0.02 
+        if dist < threshold:
+            cx, cy = self.map_coords_cache[idx]; self.snap_coord = (cx, cy)
+            if not self.snap_marker: self.snap_marker, = self.ax_m.plot([cx], [cy], 'go', markersize=8, markeredgecolor='black', alpha=0.7)
+            else: self.snap_marker.set_data([cx], [cy])
+            self.cv_m.draw_idle()
+        else:
+            self.snap_coord = None
+            if self.snap_marker: self.snap_marker.set_data([], []); self.cv_m.draw_idle()
+    def save_p(self):
+        fn,_ = QFileDialog.getSaveFileName(self,"Save","","JSON (*.json)")
+        if fn:
+            d={'pts':self.waypoints,'fs':[]}
+            for f,o in self.seismic_objects.items():
+                if "Composite" not in f: d['fs'].append({'fn':f,'st':o.settings,'vp':{'c':o.contrast,'f':o.is_flipped,'s':o.shift_ms},'hz':o.horizons})
+            with open(fn,'w') as f: json.dump(d,f)
+            QMessageBox.information(self,"Saved","Done")
+    def load_p(self):
+        fn,_ = QFileDialog.getOpenFileName(self,"Load","","JSON (*.json)")
+        if fn:
+            with open(fn,'r') as f: d=json.load(f)
+            self.waypoints=d['pts']; self.seismic_objects={}; self.lst.clear(); self.shapefile_layers=[]
+            for e in d['fs']:
+                if os.path.exists(e['fn']):
+                    self.read_file(e['fn'], e['st'])
+                    if e['fn'] in self.seismic_objects: 
+                        o=self.seismic_objects[e['fn']]
+                        o.contrast=e['vp']['c']; o.is_flipped=e['vp']['f']; o.shift_ms=e['vp']['s']; o.horizons=e['hz']
+            self.draw_map()
+            self.sync_file_list()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    window = ProjectManager()
+    window = SegyViewer()
     window.show()
     sys.exit(app.exec())
